@@ -55,7 +55,7 @@ def setup_bore_tunnel():
     # FastAPIアプリケーションをバックグラウンドで起動します。
     print("🚀 FastAPI アプリケーションを起動しています...")
     flask_process = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "main:app", "--reload"],
+        [sys.executable, "-m", "uvicorn", "main:app", "--reload", "--port", "8001"],
         # stdout=subprocess.PIPE, # ログ出力しないため削除
         # stderr=subprocess.PIPE, # ログ出力しないため削除
         # text=True,
@@ -291,34 +291,35 @@ def get_colab_external_ip():
         print(f"⚠️ 外部IPアドレスの取得に失敗しました: {e}")
         return "UNKNOWN_IP"
 
-selected_tunnel_service = ""
-while True:
-    print("\n--- トンネル方法を選択してください ---")
-    print("1. Bore")
-    print("2. Cloudflared")
-    #print("3. Localtunnel (Node.js/npm が必要です)")
-    choice = input("選択 (1/2): ").strip()
+if __name__ == "__main__":
+    selected_tunnel_service = ""
+    while True:
+        print("\n--- トンネル方法を選択してください ---")
+        print("1. Bore")
+        print("2. Cloudflared")
+        #print("3. Localtunnel (Node.js/npm が必要です)")
+        choice = input("選択 (1/2): ").strip()
 
-    if choice == '1':
-        selected_tunnel_service = "bore"
-        break
-    elif choice == '2':
-        selected_tunnel_service = "cloudflared"
-        break
-    else:
-        print("無効な選択です。1 または 2 を入力してください。")
+        if choice == '1':
+            selected_tunnel_service = "bore"
+            break
+        elif choice == '2':
+            selected_tunnel_service = "cloudflared"
+            break
+        else:
+            print("無効な選択です。1 または 2 を入力してください。")
 
 
-if selected_tunnel_service == "bore":
-    flask_process, bore_process, exposed_url = setup_bore_tunnel()
-    # bore_process.wait() # waitは削除
-elif selected_tunnel_service == "cloudflared":
-    flask_process, cloudflared_process, exposed_url = setup_cloudflare_tunnel()
-    #tunnel_process.wait() # waitは削除
+    if selected_tunnel_service == "bore":
+        flask_process, bore_process, exposed_url = setup_bore_tunnel()
+        # bore_process.wait() # waitは削除
+    elif selected_tunnel_service == "cloudflared":
+        flask_process, cloudflared_process, exposed_url = setup_cloudflare_tunnel()
+        #tunnel_process.wait() # waitは削除
 
-# プロセスがバックグラウンドで実行され続けるように、メインスレッドは特に待機しない
-# Colabのセルが実行中である限り、子プロセスは実行を続けます。
-# セルの実行が完了すると、これらのプロセスも通常終了します。
+    # プロセスがバックグラウンドで実行され続けるように、メインスレッドは特に待機しない
+    # Colabのセルが実行中である限り、子プロセスは実行を続けます。
+    # セルの実行が完了すると、これらのプロセスも通常終了します。
 
-print(f"\nColab 外部IPアドレス: {get_colab_external_ip()}")
-print(f"expose : {exposed_url}")
+    print(f"\nColab 外部IPアドレス: {get_colab_external_ip()}")
+    print(f"expose : {exposed_url}")
