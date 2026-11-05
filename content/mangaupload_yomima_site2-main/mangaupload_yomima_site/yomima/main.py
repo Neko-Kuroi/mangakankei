@@ -11,6 +11,7 @@ viewer_main.py - FastAPI router
 
 import asyncio
 import concurrent.futures
+import time
 import hashlib
 import os
 import httpx
@@ -38,6 +39,32 @@ TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 
 PLATFORM_BASE_URL = os.environ.get("PLATFORM_BASE_URL", "http://localhost:8000")
 
+# ---------------------------------------------------------------------------
+# プラットフォームのカタログ取得（短時間キャッシュ＋内部トークン）
+# ---------------------------------------------------------------------------
+CATALOG_CACHE_TTL = 60  # 秒
+_catalog_cache: dict = {"ts": 0.0, "data": None}
+
+def _internal_headers() -> dict:
+    """プラットフォームへのサーバー間通信用のヘッダ（内部トークン）。"""
+    token = os.environ.get("MANGA_INTERNAL_TOKEN", "")
+    return {"X-Internal-Token": token} if token else {}
+
+async def _fetch_platform_catalog(timeout: float = 10.0) -> list:
+    """公開カタログを取得する。成功時は60秒キャッシュし、失敗時は例外を送出する。"""
+    now = time.time()
+    if _catalog_cache["data"] is not None and now - _catalog_cache["ts"] < CATALOG_CACHE_TTL:
+        return _catalog_cache["data"]
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.get(
+            f"{PLATFORM_BASE_URL}/api/public/catalog",
+            headers=_internal_headers(),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    _catalog_cache.update({"ts": now, "data": data})
+    return data
+
 _executor       = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 _thumb_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 
@@ -45,8 +72,16 @@ _thumb_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 # IP取得（Cloudflared対応）
 # ---------------------------------------------------------------------------
 def get_client_ip(request: Request) -> str:
-    cf_ip = request.headers.get("CF-Connecting-IP")
-    return cf_ip if cf_ip else (request.client.host if request.client else "unknown")
+    """レート制限用のクライアントIP取得（プラットフォーム側と同じ規則）。
+
+    原則は接続元アドレス。CF-Connecting-IP は環境変数
+    MANGA_TRUST_CF_HEADER=1 のときだけ採用する。
+    """
+    if os.environ.get("MANGA_TRUST_CF_HEADER") == "1":
+        cf_ip = request.headers.get("CF-Connecting-IP")
+        if cf_ip:
+            return cf_ip
+    return request.client.host if request.client else "unknown"
 
 # ---------------------------------------------------------------------------
 # レート制限
@@ -109,10 +144,7 @@ async def public_catalog(request: Request):
     catalog   = []
     error_msg = None
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(f"{PLATFORM_BASE_URL}/api/public/catalog")
-            resp.raise_for_status()
-            catalog = resp.json()
+        catalog = await _fetch_platform_catalog()
     except Exception as e:
         error_msg = f"カタログの取得に失敗しました: {e}"
 
@@ -232,27 +264,23 @@ async def reader(
     webhook_enabled = not is_platform_url   # 外部URL → True、プラットフォーム → カタログ確認後に決定
 
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            catalog_url = f"{PLATFORM_BASE_URL}/api/public/catalog"
-            resp = await client.get(catalog_url)
-            if resp.status_code == 200:
-                catalog = resp.json()
-                for item in catalog:
-                    if item.get("cbz_url") == url:
-                        scrambled = item.get("scrambled", False)
-                        tile_size = item.get("tile_size", 16)
-                        # プラットフォーム作品のみ作者設定を反映。外部URLは上書きしない。
-                        if is_platform_url:
-                            webhook_enabled = item.get("webhook_enabled", False)
-                        t = item.get("title_name", "").strip()
-                        e = item.get("episode_name", "").strip()
-                        if t and e:
-                            manga_title_display = f"{t} — {e}"
-                        elif t:
-                            manga_title_display = t
-                        elif e:
-                            manga_title_display = e
-                        break
+        catalog = await _fetch_platform_catalog(timeout=5.0)
+        for item in catalog:
+            if item.get("cbz_url") == url:
+                scrambled = item.get("scrambled", False)
+                tile_size = item.get("tile_size", 16)
+                # プラットフォーム作品のみ作者設定を反映。外部URLは上書きしない。
+                if is_platform_url:
+                    webhook_enabled = item.get("webhook_enabled", False)
+                t = item.get("title_name", "").strip()
+                e = item.get("episode_name", "").strip()
+                if t and e:
+                    manga_title_display = f"{t} — {e}"
+                elif t:
+                    manga_title_display = t
+                elif e:
+                    manga_title_display = e
+                break
     except Exception:
         pass
 

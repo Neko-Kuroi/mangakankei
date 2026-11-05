@@ -1,3 +1,6 @@
+# これは Colab テスト環境用の起動ハーネスです（アプリ本体ではありません）。
+# 本体の起動は uvicorn main:app を直接使ってください。
+# トンネル（bore / cloudflared）はテスト環境の都合であり、本体はトンネル非依存です。
 import time
 import os
 #import hashlib

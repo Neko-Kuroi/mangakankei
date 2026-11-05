@@ -172,9 +172,17 @@ class EpisodePublishSettings(BaseModel):
 # ---------------------------------------------------------------------------
 
 def get_client_ip(request: Request) -> str:
-    """CloudflaredのCF-Connecting-IPヘッダーに対応したIP取得"""
-    cf_ip = request.headers.get("CF-Connecting-IP")
-    return cf_ip if cf_ip else (request.client.host if request.client else "unknown")
+    """レート制限用のクライアントIP取得。
+
+    原則は接続元アドレスを使う。CF-Connecting-IP はクライアントが自由に
+    書けるヘッダなので無条件には信頼せず、cloudflared の裏で動かす場合に
+    限り、環境変数 MANGA_TRUST_CF_HEADER=1 のときだけ採用する。
+    """
+    if os.environ.get("MANGA_TRUST_CF_HEADER") == "1":
+        cf_ip = request.headers.get("CF-Connecting-IP")
+        if cf_ip:
+            return cf_ip
+    return request.client.host if request.client else "unknown"
 
 def natural_keys(text: str):
     return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', text)]
@@ -294,6 +302,23 @@ upload_progress: dict[str, dict] = {}
 _view_cooldown: dict[str, float] = {}
 VIEW_COOLDOWN_SECONDS = 3600  # 同一IPは1時間に1カウント
 
+# ---------------------------------------------------------------------------
+# settings.json の書き込み（ロック＋原子的差し替え）
+# ---------------------------------------------------------------------------
+_settings_lock = threading.Lock()
+
+def _save_settings(settings_path: Path, meta: dict) -> None:
+    """settings.json を一時ファイル経由で原子的に書き換える。
+
+    書き手（設定保存・閲覧数カウント）は _settings_lock の下で
+    読み→更新→この関数、の順で使うこと。読み手は rename のため
+    常に完全なファイルだけを見る。
+    """
+    tmp_path = settings_path.with_suffix(".json.tmp")
+    with open(tmp_path, "w") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, settings_path)
+
 def increment_view_count(settings_path: Path, client_ip: str) -> None:
     """settings.jsonのview_countを1増やす（IPクールダウン付き）"""
     cooldown_key = f"{settings_path}:{client_ip}"
@@ -302,11 +327,11 @@ def increment_view_count(settings_path: Path, client_ip: str) -> None:
     if now - last < VIEW_COOLDOWN_SECONDS:
         return  # クールダウン中はカウントしない
     try:
-        with open(settings_path, "r") as f:
-            meta = json.load(f)
-        meta["view_count"] = meta.get("view_count", 0) + 1
-        with open(settings_path, "w") as f:
-            json.dump(meta, f, ensure_ascii=False, indent=2)
+        with _settings_lock:
+            with open(settings_path, "r") as f:
+                meta = json.load(f)
+            meta["view_count"] = meta.get("view_count", 0) + 1
+            _save_settings(settings_path, meta)
         _view_cooldown[cooldown_key] = now
     except Exception as e:
         logger.warning(f"view_count更新失敗: {e}")
@@ -324,6 +349,21 @@ def update_progress(job_id: str, phase: str, current: int, total: int, **kwargs)
 # ---------------------------------------------------------------------------
 def get_ip_for_limit(request: Request) -> str:
     return get_client_ip(request)
+
+def _is_internal_request(request: Request) -> bool:
+    """同一マシン上の内部クライアント（閲覧側など）からのリクエストかどうか。
+
+    localhost からの接続で、環境変数 MANGA_INTERNAL_TOKEN と一致する
+    X-Internal-Token ヘッダがある場合のみ内部扱いにする。
+    内部リクエストは公開カタログ・CBZ のレート制限の対象外
+    （読者全員分を代表して取得するため、IP 枠を共有させない）。
+    """
+    token = os.environ.get("MANGA_INTERNAL_TOKEN", "")
+    if not token:
+        return False
+    if not request.client or request.client.host not in ("127.0.0.1", "::1"):
+        return False
+    return secrets.compare_digest(request.headers.get("X-Internal-Token", ""), token)
 
 limiter = Limiter(key_func=get_ip_for_limit)
 
@@ -499,10 +539,14 @@ def _process_upload(
     user_dir  = FINAL_ZIP_DIR / f"user_{user_id}" / f"title_{title_id}"
     user_dir.mkdir(parents=True, exist_ok=True)
     thumb_dir = user_dir / f"episode_{episode_id}_thumbs"
-    thumb_dir.mkdir(exist_ok=True)
     final_zip_path = user_dir / f"episode_{episode_id}.cbz"
     work_dir = TMP_DIR / f"u{user_id}_t{title_id}_e{episode_id}_{uuid.uuid4().hex[:6]}"
     work_dir.mkdir(parents=True, exist_ok=True)
+    # 成果物は作業領域で完成させてから差し替える（失敗時に既存の公開物を壊さない）
+    work_thumb_dir = work_dir / "thumbs"
+    work_thumb_dir.mkdir(exist_ok=True)
+    tmp_zip_path   = work_dir / f"episode_{episode_id}.cbz"
+    tmp_cover_path = work_dir / "cover.jpg"
 
     _upload_semaphore.acquire()
     try:
@@ -528,7 +572,7 @@ def _process_upload(
                 img.save(resized_path, "PNG")
 
             # サムネイル生成（非スクランブル）
-            generate_thumbnail(resized_path, thumb_dir, index)
+            generate_thumbnail(resized_path, work_thumb_dir, index)
 
             update_progress(job_id, "scramble", index + 1, total)
 
@@ -548,20 +592,30 @@ def _process_upload(
             raw_path.unlink()
             resized_path.unlink()
 
+        if not saved_pages:
+            raise ValueError("有効な画像ファイルがありませんでした")
+
         # ── CBZ作成（ZIP_STORED: 画像は既に圧縮済みのため再圧縮不要）──
         update_progress(job_id, "zip", 0, len(saved_pages))
-        with zipfile.ZipFile(final_zip_path, 'w', zipfile.ZIP_STORED) as comic_zip:
+        with zipfile.ZipFile(tmp_zip_path, 'w', zipfile.ZIP_STORED) as comic_zip:
             for i, p in enumerate(saved_pages):
                 update_progress(job_id, "zip", i + 1, len(saved_pages))
                 comic_zip.write(p, arcname=p.name)
 
-        # ── バンプ画像保存 ──
+        # ── バンプ画像保存（作業領域へ）──
         if cover_spool_path and cover_filename:
-            cover_path = user_dir / f"episode_{episode_id}_cover.jpg"
             with Image.open(cover_spool_path) as img:
                 img = img.convert("RGB")
                 img.thumbnail((600, 900), Image.LANCZOS)
-                img.save(cover_path, "JPEG", quality=85)
+                img.save(tmp_cover_path, "JPEG", quality=85)
+
+        # ── 成果物の差し替え（ここまでは既存の公開物に触れていない）──
+        os.replace(tmp_zip_path, final_zip_path)
+        if thumb_dir.exists():
+            shutil.rmtree(thumb_dir)
+        os.replace(work_thumb_dir, thumb_dir)
+        if tmp_cover_path.exists():
+            os.replace(tmp_cover_path, user_dir / f"episode_{episode_id}_cover.jpg")
 
         update_progress(
             job_id, "done", len(saved_pages), len(saved_pages),
@@ -618,34 +672,38 @@ async def update_settings(
     user_dir.mkdir(parents=True, exist_ok=True)
     settings_path = user_dir / f"episode_{episode_id}_settings.json"
 
-    existing = {}
-    if settings_path.exists():
-        with open(settings_path, "r") as f:
-            existing = json.load(f)
+    # CBZ が無いエピソードは公開できない（カタログに並ぶのに開けない作品を防ぐ）
+    if settings.status == "published" and not (user_dir / f"episode_{episode_id}.cbz").exists():
+        raise HTTPException(status_code=400, detail="先に原稿をアップロードしてください")
 
-    existing.update({
-        "status":          settings.status,
-        "access_level":    settings.access_level,
-        "price":           settings.price,
-        "title_name":      settings.title_name,
-        "episode_name":    settings.episode_name,
-        "caption":         settings.caption,
-        "comment":         settings.comment,
-        "note":            settings.note,
-        "scrambled":       settings.scrambled,
-        "tile_size":       settings.tile_size,
-        "webhook_enabled": settings.webhook_enabled,
-        "author_name":     current_user.username,
-        "author_id":       current_user.id,
-        "title_id":        title_id,
-        "episode_id":      episode_id,
-        "updated_at":      time.time(),
-    })
-    if "created_at" not in existing:
-        existing["created_at"] = time.time()
+    with _settings_lock:
+        existing = {}
+        if settings_path.exists():
+            with open(settings_path, "r") as f:
+                existing = json.load(f)
 
-    with open(settings_path, "w") as f:
-        json.dump(existing, f, indent=4, ensure_ascii=False)
+        existing.update({
+            "status":          settings.status,
+            "access_level":    settings.access_level,
+            "price":           settings.price,
+            "title_name":      settings.title_name,
+            "episode_name":    settings.episode_name,
+            "caption":         settings.caption,
+            "comment":         settings.comment,
+            "note":            settings.note,
+            "scrambled":       settings.scrambled,
+            "tile_size":       settings.tile_size,
+            "webhook_enabled": settings.webhook_enabled,
+            "author_name":     current_user.username,
+            "author_id":       current_user.id,
+            "title_id":        title_id,
+            "episode_id":      episode_id,
+            "updated_at":      time.time(),
+        })
+        if "created_at" not in existing:
+            existing["created_at"] = time.time()
+
+        _save_settings(settings_path, existing)
 
     return {"status": "success"}
 
@@ -773,7 +831,7 @@ async def author_cover(
 # ---------------------------------------------------------------------------
 
 @app.get("/api/public/cbz/{user_id}/{title_id}/{episode_id}.cbz")
-@limiter.limit("10/minute")
+@limiter.limit("10/minute", exempt_when=_is_internal_request)
 async def serve_public_cbz(
     request:    Request,
     user_id:    int,
@@ -840,7 +898,7 @@ async def public_thumb(user_id: int, title_id: int, episode_id: int, index: int)
 # ---------------------------------------------------------------------------
 
 @app.get("/api/public/catalog")
-@limiter.limit("5/minute")
+@limiter.limit("5/minute", exempt_when=_is_internal_request)
 async def public_catalog(request: Request):
     base_url       = str(request.base_url).rstrip("/")
     published_list = []

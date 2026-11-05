@@ -1,0 +1,169 @@
+--- a/mangaupload_yomima_site/main.py
++++ b/mangaupload_yomima_site/main.py
+@@ -294,6 +294,23 @@
+ _view_cooldown: dict[str, float] = {}
+ VIEW_COOLDOWN_SECONDS = 3600  # 同一IPは1時間に1カウント
+ 
++# ---------------------------------------------------------------------------
++# settings.json の書き込み（ロック＋原子的差し替え）
++# ---------------------------------------------------------------------------
++_settings_lock = threading.Lock()
++
++def _save_settings(settings_path: Path, meta: dict) -> None:
++    """settings.json を一時ファイル経由で原子的に書き換える。
++
++    書き手（設定保存・閲覧数カウント）は _settings_lock の下で
++    読み→更新→この関数、の順で使うこと。読み手は rename のため
++    常に完全なファイルだけを見る。
++    """
++    tmp_path = settings_path.with_suffix(".json.tmp")
++    with open(tmp_path, "w") as f:
++        json.dump(meta, f, ensure_ascii=False, indent=2)
++    os.replace(tmp_path, settings_path)
++
+ def increment_view_count(settings_path: Path, client_ip: str) -> None:
+     """settings.jsonのview_countを1増やす（IPクールダウン付き）"""
+     cooldown_key = f"{settings_path}:{client_ip}"
+@@ -302,11 +319,11 @@
+     if now - last < VIEW_COOLDOWN_SECONDS:
+         return  # クールダウン中はカウントしない
+     try:
+-        with open(settings_path, "r") as f:
+-            meta = json.load(f)
+-        meta["view_count"] = meta.get("view_count", 0) + 1
+-        with open(settings_path, "w") as f:
+-            json.dump(meta, f, ensure_ascii=False, indent=2)
++        with _settings_lock:
++            with open(settings_path, "r") as f:
++                meta = json.load(f)
++            meta["view_count"] = meta.get("view_count", 0) + 1
++            _save_settings(settings_path, meta)
+         _view_cooldown[cooldown_key] = now
+     except Exception as e:
+         logger.warning(f"view_count更新失敗: {e}")
+@@ -499,10 +516,14 @@
+     user_dir  = FINAL_ZIP_DIR / f"user_{user_id}" / f"title_{title_id}"
+     user_dir.mkdir(parents=True, exist_ok=True)
+     thumb_dir = user_dir / f"episode_{episode_id}_thumbs"
+-    thumb_dir.mkdir(exist_ok=True)
+     final_zip_path = user_dir / f"episode_{episode_id}.cbz"
+     work_dir = TMP_DIR / f"u{user_id}_t{title_id}_e{episode_id}_{uuid.uuid4().hex[:6]}"
+     work_dir.mkdir(parents=True, exist_ok=True)
++    # 成果物は作業領域で完成させてから差し替える（失敗時に既存の公開物を壊さない）
++    work_thumb_dir = work_dir / "thumbs"
++    work_thumb_dir.mkdir(exist_ok=True)
++    tmp_zip_path   = work_dir / f"episode_{episode_id}.cbz"
++    tmp_cover_path = work_dir / "cover.jpg"
+ 
+     _upload_semaphore.acquire()
+     try:
+@@ -528,7 +549,7 @@
+                 img.save(resized_path, "PNG")
+ 
+             # サムネイル生成（非スクランブル）
+-            generate_thumbnail(resized_path, thumb_dir, index)
++            generate_thumbnail(resized_path, work_thumb_dir, index)
+ 
+             update_progress(job_id, "scramble", index + 1, total)
+ 
+@@ -548,20 +569,30 @@
+             raw_path.unlink()
+             resized_path.unlink()
+ 
++        if not saved_pages:
++            raise ValueError("有効な画像ファイルがありませんでした")
++
+         # ── CBZ作成（ZIP_STORED: 画像は既に圧縮済みのため再圧縮不要）──
+         update_progress(job_id, "zip", 0, len(saved_pages))
+-        with zipfile.ZipFile(final_zip_path, 'w', zipfile.ZIP_STORED) as comic_zip:
++        with zipfile.ZipFile(tmp_zip_path, 'w', zipfile.ZIP_STORED) as comic_zip:
+             for i, p in enumerate(saved_pages):
+                 update_progress(job_id, "zip", i + 1, len(saved_pages))
+                 comic_zip.write(p, arcname=p.name)
+ 
+-        # ── バンプ画像保存 ──
++        # ── バンプ画像保存（作業領域へ）──
+         if cover_spool_path and cover_filename:
+-            cover_path = user_dir / f"episode_{episode_id}_cover.jpg"
+             with Image.open(cover_spool_path) as img:
+                 img = img.convert("RGB")
+                 img.thumbnail((600, 900), Image.LANCZOS)
+-                img.save(cover_path, "JPEG", quality=85)
++                img.save(tmp_cover_path, "JPEG", quality=85)
++
++        # ── 成果物の差し替え（ここまでは既存の公開物に触れていない）──
++        os.replace(tmp_zip_path, final_zip_path)
++        if thumb_dir.exists():
++            shutil.rmtree(thumb_dir)
++        os.replace(work_thumb_dir, thumb_dir)
++        if tmp_cover_path.exists():
++            os.replace(tmp_cover_path, user_dir / f"episode_{episode_id}_cover.jpg")
+ 
+         update_progress(
+             job_id, "done", len(saved_pages), len(saved_pages),
+@@ -618,34 +649,38 @@
+     user_dir.mkdir(parents=True, exist_ok=True)
+     settings_path = user_dir / f"episode_{episode_id}_settings.json"
+ 
+-    existing = {}
+-    if settings_path.exists():
+-        with open(settings_path, "r") as f:
+-            existing = json.load(f)
+-
+-    existing.update({
+-        "status":          settings.status,
+-        "access_level":    settings.access_level,
+-        "price":           settings.price,
+-        "title_name":      settings.title_name,
+-        "episode_name":    settings.episode_name,
+-        "caption":         settings.caption,
+-        "comment":         settings.comment,
+-        "note":            settings.note,
+-        "scrambled":       settings.scrambled,
+-        "tile_size":       settings.tile_size,
+-        "webhook_enabled": settings.webhook_enabled,
+-        "author_name":     current_user.username,
+-        "author_id":       current_user.id,
+-        "title_id":        title_id,
+-        "episode_id":      episode_id,
+-        "updated_at":      time.time(),
+-    })
+-    if "created_at" not in existing:
+-        existing["created_at"] = time.time()
++    # CBZ が無いエピソードは公開できない（カタログに並ぶのに開けない作品を防ぐ）
++    if settings.status == "published" and not (user_dir / f"episode_{episode_id}.cbz").exists():
++        raise HTTPException(status_code=400, detail="先に原稿をアップロードしてください")
++
++    with _settings_lock:
++        existing = {}
++        if settings_path.exists():
++            with open(settings_path, "r") as f:
++                existing = json.load(f)
++
++        existing.update({
++            "status":          settings.status,
++            "access_level":    settings.access_level,
++            "price":           settings.price,
++            "title_name":      settings.title_name,
++            "episode_name":    settings.episode_name,
++            "caption":         settings.caption,
++            "comment":         settings.comment,
++            "note":            settings.note,
++            "scrambled":       settings.scrambled,
++            "tile_size":       settings.tile_size,
++            "webhook_enabled": settings.webhook_enabled,
++            "author_name":     current_user.username,
++            "author_id":       current_user.id,
++            "title_id":        title_id,
++            "episode_id":      episode_id,
++            "updated_at":      time.time(),
++        })
++        if "created_at" not in existing:
++            existing["created_at"] = time.time()
+ 
+-    with open(settings_path, "w") as f:
+-        json.dump(existing, f, indent=4, ensure_ascii=False)
++        _save_settings(settings_path, existing)
+ 
+     return {"status": "success"}
+ 

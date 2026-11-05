@@ -194,8 +194,14 @@ def download_file(
         return True, ""
 
     max_bytes = max_size_mb * 1024 * 1024
+    # 内部トークンはプラットフォーム宛ての通信にだけ付ける（外部URLへは漏らさない）
+    headers = {}
+    internal_token = os.environ.get("MANGA_INTERNAL_TOKEN", "")
+    platform_base  = os.environ.get("PLATFORM_BASE_URL", "http://localhost:8000")
+    if internal_token and url.startswith(platform_base):
+        headers["X-Internal-Token"] = internal_token
     try:
-        response = requests.get(url, stream=True, timeout=(10, 60))
+        response = requests.get(url, stream=True, timeout=(10, 60), headers=headers)
         response.raise_for_status()
         total_size = int(response.headers.get('content-length', 0))
 
