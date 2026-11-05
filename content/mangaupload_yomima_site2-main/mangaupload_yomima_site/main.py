@@ -9,6 +9,7 @@ import logging
 import tempfile
 import secrets
 import asyncio
+import threading
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime, timedelta, UTC
@@ -415,6 +416,9 @@ async def get_my_works(current_user: User = Depends(get_current_user)):
 # 作者：アップロード開始（job_idを返してバックグラウンドで処理）
 # ---------------------------------------------------------------------------
 
+# 同時に処理するアップロードジョブの上限（メモリ使用量を抑える）
+_upload_semaphore = threading.Semaphore(2)
+
 @app.post("/api/author/titles/{title_id}/episodes/{episode_id}/upload-and-zip")
 async def upload_manga(
     title_id:         int,
@@ -428,59 +432,68 @@ async def upload_manga(
 ):
     validate_tile_size(tile_size)
 
-    # ── バリデーション ──
-    total_size = 0
-    for f in files:
-        content = await f.read()
-        await f.seek(0)
-        size = len(content)
-        if size > MAX_PAGE_SIZE_BYTES:
-            raise HTTPException(400, f"{f.filename} が {MAX_PAGE_SIZE_MB}MB を超えています")
-        total_size += size
-        if total_size > MAX_TOTAL_SIZE_BYTES:
-            raise HTTPException(400, f"合計サイズが {MAX_TOTAL_SIZE_MB}MB を超えています")
-
-    if cover:
-        cover_content = await cover.read()
-        await cover.seek(0)
-        if len(cover_content) > MAX_COVER_SIZE_BYTES:
-            raise HTTPException(400, f"バンプ画像が {MAX_COVER_SIZE_MB}MB を超えています")
-
     # ── job_id 発行 ──
     job_id = uuid.uuid4().hex
     update_progress(job_id, "queued", 0, len(files))
 
-    # ── バックグラウンドタスクに渡すためにファイル内容を読み込む ──
-    file_contents = []
-    for f in files:
-        content = await f.read()
-        file_contents.append((f.filename, content))
+    # ── バリデーションしながら一時ファイルへ書き出す ──
+    # ファイル内容をメモリに保持せず、背景処理へはパスを渡す
+    spool_dir = TMP_DIR / f"spool_{job_id}"
+    spool_dir.mkdir(parents=True, exist_ok=True)
+    file_paths: list = []
+    cover_spool_path = None
+    cover_filename   = None
+    try:
+        total_size = 0
+        for i, f in enumerate(files):
+            spool_path = spool_dir / f"upload_{i:04d}"
+            size = 0
+            with open(spool_path, "wb") as out:
+                while chunk := await f.read(1024 * 1024):
+                    size += len(chunk)
+                    if size > MAX_PAGE_SIZE_BYTES:
+                        raise HTTPException(400, f"{f.filename} が {MAX_PAGE_SIZE_MB}MB を超えています")
+                    total_size += len(chunk)
+                    if total_size > MAX_TOTAL_SIZE_BYTES:
+                        raise HTTPException(400, f"合計サイズが {MAX_TOTAL_SIZE_MB}MB を超えています")
+                    out.write(chunk)
+            file_paths.append((f.filename, spool_path))
 
-    cover_content = None
-    cover_filename = None
-    if cover:
-        cover_content  = await cover.read()
-        cover_filename = cover.filename
+        if cover:
+            cover_filename   = cover.filename
+            cover_spool_path = spool_dir / "cover_upload"
+            cover_size = 0
+            with open(cover_spool_path, "wb") as out:
+                while chunk := await cover.read(1024 * 1024):
+                    cover_size += len(chunk)
+                    if cover_size > MAX_COVER_SIZE_BYTES:
+                        raise HTTPException(400, f"バンプ画像が {MAX_COVER_SIZE_MB}MB を超えています")
+                    out.write(chunk)
+    except HTTPException:
+        shutil.rmtree(spool_dir, ignore_errors=True)
+        upload_progress.pop(job_id, None)
+        raise
 
     background_tasks.add_task(
         _process_upload,
         job_id, title_id, episode_id,
-        file_contents, cover_content, cover_filename,
-        do_scramble, tile_size, current_user.id,
+        file_paths, cover_spool_path, cover_filename,
+        do_scramble, tile_size, current_user.id, spool_dir,
     )
 
     return {"job_id": job_id, "total_files": len(files)}
 
 def _process_upload(
-    job_id:         str,
-    title_id:       int,
-    episode_id:     int,
-    file_contents:  list,
-    cover_content:  Optional[bytes],
-    cover_filename: Optional[str],
-    do_scramble:    bool,
-    tile_size:      int,
-    user_id:        int,
+    job_id:           str,
+    title_id:         int,
+    episode_id:       int,
+    file_paths:       list,
+    cover_spool_path: Optional[Path],
+    cover_filename:   Optional[str],
+    do_scramble:      bool,
+    tile_size:        int,
+    user_id:          int,
+    spool_dir:        Path,
 ):
     """バックグラウンドで実行されるアップロード処理"""
     user_dir  = FINAL_ZIP_DIR / f"user_{user_id}" / f"title_{title_id}"
@@ -491,22 +504,21 @@ def _process_upload(
     work_dir = TMP_DIR / f"u{user_id}_t{title_id}_e{episode_id}_{uuid.uuid4().hex[:6]}"
     work_dir.mkdir(parents=True, exist_ok=True)
 
+    _upload_semaphore.acquire()
     try:
         # ── ファイル名でソート ──
-        file_contents.sort(key=lambda x: natural_keys(x[0]))
-        total = len(file_contents)
+        file_paths.sort(key=lambda x: natural_keys(x[0]))
+        total = len(file_paths)
         saved_pages = []
 
-        for index, (filename, content) in enumerate(file_contents):
+        for index, (filename, spool_path) in enumerate(file_paths):
             suffix = Path(filename).suffix.lower()
             if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
                 continue
 
             update_progress(job_id, "resize", index + 1, total)
 
-            raw_path = work_dir / f"raw_{index:04d}"  # 連番名にする（元のファイル名をパスに使わない）
-            with open(raw_path, "wb") as f:
-                f.write(content)
+            raw_path = spool_path  # 受け取り時に書き出した一時ファイルをそのまま使う
 
             # リサイズ（スクランブル前）
             with Image.open(raw_path) as img:
@@ -544,10 +556,9 @@ def _process_upload(
                 comic_zip.write(p, arcname=p.name)
 
         # ── バンプ画像保存 ──
-        if cover_content and cover_filename:
+        if cover_spool_path and cover_filename:
             cover_path = user_dir / f"episode_{episode_id}_cover.jpg"
-            suffix = Path(cover_filename).suffix.lower()
-            with Image.open(BytesIO(cover_content)) as img:
+            with Image.open(cover_spool_path) as img:
                 img = img.convert("RGB")
                 img.thumbnail((600, 900), Image.LANCZOS)
                 img.save(cover_path, "JPEG", quality=85)
@@ -563,8 +574,11 @@ def _process_upload(
         update_progress(job_id, "error", 0, 0, message=str(e))
         logger.error(f"Upload error [{job_id}]: {e}")
     finally:
+        _upload_semaphore.release()
         if work_dir.exists():
             shutil.rmtree(work_dir)
+        if spool_dir.exists():
+            shutil.rmtree(spool_dir)
 
 # ---------------------------------------------------------------------------
 # 作者：アップロード進捗（ポーリング用GET）

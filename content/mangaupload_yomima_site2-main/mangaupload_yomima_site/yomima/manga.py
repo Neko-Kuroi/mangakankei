@@ -32,6 +32,9 @@ MAX_MANGA_COUNT     = 12
 CACHE_SIZE_LIMIT_MB = 270
 IMAGES_PER_LOAD     = 1          # 1枚ずつfetch（reader.htmlのbuffer方式に合わせる）
 MAX_DOWNLOAD_SIZE_MB = 240
+MAX_EXTRACT_ENTRY_MB = 50     # 解凍: 1エントリの上限
+MAX_EXTRACT_TOTAL_MB = 480    # 解凍: 展開合計の上限（ダウンロード上限の2倍）
+MAX_EXTRACT_FILES    = 2500   # 解凍: エントリ数の上限
 IMAGE_EXTENSIONS    = ('.jpg', '.jpeg', '.png', '.webp', '.gif')
 ARCHIVE_EXTENSIONS  = ('.zip', '.cbz', '.rar', '.cbr')
 CACHE_TTL_SECONDS   = 86400 / 48  # ~30分
@@ -207,7 +210,7 @@ def download_file(
                 if not chunk:
                     continue
                 bytes_downloaded += len(chunk)
-                if total_size == 0 and bytes_downloaded > max_bytes:
+                if bytes_downloaded > max_bytes:
                     os.remove(tmp_path)
                     return False, f"ダウンロードが {max_size_mb}MB を超えたため中止しました"
                 f.write(chunk)
@@ -272,35 +275,67 @@ def extract_archive(archive_path: str, extract_to: str) -> tuple[list[str], list
     warnings:    list[str] = []
     is_rar = is_rar_archive(archive_path)
 
+    entry_max = MAX_EXTRACT_ENTRY_MB * 1024 * 1024
+    total_max = MAX_EXTRACT_TOTAL_MB * 1024 * 1024
+
     try:
         archive = rarfile.RarFile(archive_path) if is_rar else zipfile.ZipFile(archive_path)
         with archive:
+            total_written = 0
             for index, file_info in enumerate(archive.infolist()):
+                if index >= MAX_EXTRACT_FILES:
+                    warnings.append(f"エントリ数が上限 ({MAX_EXTRACT_FILES}) に達したため打ち切りました")
+                    break
                 filename = file_info.filename
                 if filename.endswith('/') or filename.endswith('\\'):
                     continue
-                try:
-                    data = archive.read(file_info)
-                except Exception as e:
-                    warnings.append(f"読み込みスキップ: {os.path.basename(filename)} ({e})")
+                if file_info.file_size > entry_max:
+                    warnings.append(
+                        f"サイズ上限のためスキップ: {os.path.basename(filename)}"
+                        f" ({file_info.file_size / 1024 / 1024:.1f}MB)"
+                    )
                     continue
 
-                if is_valid_image(filename):
-                    ext = os.path.splitext(
-                        os.path.basename(filename).replace('\\', '/').split('/')[-1]
-                    )[1].lower()
-                else:
-                    ext = guess_ext_from_bytes(data)
-                    if not ext:
-                        continue
-
                 try:
-                    safe_name = get_safe_filename(filename, index, ext_override=ext)
-                    dest      = os.path.join(extract_to, safe_name)
-                    if not os.path.exists(dest):
+                    with archive.open(file_info) as src:
+                        head = src.read(16)
+
+                        if is_valid_image(filename):
+                            ext = os.path.splitext(
+                                os.path.basename(filename).replace('\\', '/').split('/')[-1]
+                            )[1].lower()
+                        else:
+                            ext = guess_ext_from_bytes(head)
+                            if not ext:
+                                continue
+
+                        safe_name = get_safe_filename(filename, index, ext_override=ext)
+                        dest      = os.path.join(extract_to, safe_name)
+                        if os.path.exists(dest):
+                            image_files.append(dest)
+                            continue
+
+                        written = 0
+                        chunk   = head
                         with open(dest, 'wb') as f:
-                            f.write(data)
-                    image_files.append(dest)
+                            while chunk:
+                                written += len(chunk)
+                                if written > entry_max or total_written + written > total_max:
+                                    break
+                                f.write(chunk)
+                                chunk = src.read(1024 * 1024)
+
+                        if total_written + written > total_max:
+                            os.remove(dest)
+                            warnings.append(f"展開合計が上限 ({MAX_EXTRACT_TOTAL_MB}MB) に達したため打ち切りました")
+                            break
+                        if written > entry_max:
+                            os.remove(dest)
+                            warnings.append(f"サイズ上限のためスキップ: {os.path.basename(filename)}")
+                            continue
+
+                        total_written += written
+                        image_files.append(dest)
                 except Exception as e:
                     warnings.append(f"スキップ: {os.path.basename(filename)} ({e})")
 

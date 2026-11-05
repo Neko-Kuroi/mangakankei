@@ -1,0 +1,289 @@
+--- a/mangaupload_yomima_site/main.py
++++ b/mangaupload_yomima_site/main.py
+@@ -9,6 +9,7 @@
+ import tempfile
+ import secrets
+ import asyncio
++import threading
+ from io import BytesIO
+ from pathlib import Path
+ from datetime import datetime, timedelta, UTC
+@@ -415,6 +416,9 @@
+ # 作者：アップロード開始（job_idを返してバックグラウンドで処理）
+ # ---------------------------------------------------------------------------
+ 
++# 同時に処理するアップロードジョブの上限（メモリ使用量を抑える）
++_upload_semaphore = threading.Semaphore(2)
++
+ @app.post("/api/author/titles/{title_id}/episodes/{episode_id}/upload-and-zip")
+ async def upload_manga(
+     title_id:         int,
+@@ -428,59 +432,68 @@
+ ):
+     validate_tile_size(tile_size)
+ 
+-    # ── バリデーション ──
+-    total_size = 0
+-    for f in files:
+-        content = await f.read()
+-        await f.seek(0)
+-        size = len(content)
+-        if size > MAX_PAGE_SIZE_BYTES:
+-            raise HTTPException(400, f"{f.filename} が {MAX_PAGE_SIZE_MB}MB を超えています")
+-        total_size += size
+-        if total_size > MAX_TOTAL_SIZE_BYTES:
+-            raise HTTPException(400, f"合計サイズが {MAX_TOTAL_SIZE_MB}MB を超えています")
+-
+-    if cover:
+-        cover_content = await cover.read()
+-        await cover.seek(0)
+-        if len(cover_content) > MAX_COVER_SIZE_BYTES:
+-            raise HTTPException(400, f"バンプ画像が {MAX_COVER_SIZE_MB}MB を超えています")
+-
+     # ── job_id 発行 ──
+     job_id = uuid.uuid4().hex
+     update_progress(job_id, "queued", 0, len(files))
+ 
+-    # ── バックグラウンドタスクに渡すためにファイル内容を読み込む ──
+-    file_contents = []
+-    for f in files:
+-        content = await f.read()
+-        file_contents.append((f.filename, content))
+-
+-    cover_content = None
+-    cover_filename = None
+-    if cover:
+-        cover_content  = await cover.read()
+-        cover_filename = cover.filename
++    # ── バリデーションしながら一時ファイルへ書き出す ──
++    # ファイル内容をメモリに保持せず、背景処理へはパスを渡す
++    spool_dir = TMP_DIR / f"spool_{job_id}"
++    spool_dir.mkdir(parents=True, exist_ok=True)
++    file_paths: list = []
++    cover_spool_path = None
++    cover_filename   = None
++    try:
++        total_size = 0
++        for i, f in enumerate(files):
++            spool_path = spool_dir / f"upload_{i:04d}"
++            size = 0
++            with open(spool_path, "wb") as out:
++                while chunk := await f.read(1024 * 1024):
++                    size += len(chunk)
++                    if size > MAX_PAGE_SIZE_BYTES:
++                        raise HTTPException(400, f"{f.filename} が {MAX_PAGE_SIZE_MB}MB を超えています")
++                    total_size += len(chunk)
++                    if total_size > MAX_TOTAL_SIZE_BYTES:
++                        raise HTTPException(400, f"合計サイズが {MAX_TOTAL_SIZE_MB}MB を超えています")
++                    out.write(chunk)
++            file_paths.append((f.filename, spool_path))
++
++        if cover:
++            cover_filename   = cover.filename
++            cover_spool_path = spool_dir / "cover_upload"
++            cover_size = 0
++            with open(cover_spool_path, "wb") as out:
++                while chunk := await cover.read(1024 * 1024):
++                    cover_size += len(chunk)
++                    if cover_size > MAX_COVER_SIZE_BYTES:
++                        raise HTTPException(400, f"バンプ画像が {MAX_COVER_SIZE_MB}MB を超えています")
++                    out.write(chunk)
++    except HTTPException:
++        shutil.rmtree(spool_dir, ignore_errors=True)
++        upload_progress.pop(job_id, None)
++        raise
+ 
+     background_tasks.add_task(
+         _process_upload,
+         job_id, title_id, episode_id,
+-        file_contents, cover_content, cover_filename,
+-        do_scramble, tile_size, current_user.id,
++        file_paths, cover_spool_path, cover_filename,
++        do_scramble, tile_size, current_user.id, spool_dir,
+     )
+ 
+     return {"job_id": job_id, "total_files": len(files)}
+ 
+ def _process_upload(
+-    job_id:         str,
+-    title_id:       int,
+-    episode_id:     int,
+-    file_contents:  list,
+-    cover_content:  Optional[bytes],
+-    cover_filename: Optional[str],
+-    do_scramble:    bool,
+-    tile_size:      int,
+-    user_id:        int,
++    job_id:           str,
++    title_id:         int,
++    episode_id:       int,
++    file_paths:       list,
++    cover_spool_path: Optional[Path],
++    cover_filename:   Optional[str],
++    do_scramble:      bool,
++    tile_size:        int,
++    user_id:          int,
++    spool_dir:        Path,
+ ):
+     """バックグラウンドで実行されるアップロード処理"""
+     user_dir  = FINAL_ZIP_DIR / f"user_{user_id}" / f"title_{title_id}"
+@@ -491,22 +504,21 @@
+     work_dir = TMP_DIR / f"u{user_id}_t{title_id}_e{episode_id}_{uuid.uuid4().hex[:6]}"
+     work_dir.mkdir(parents=True, exist_ok=True)
+ 
++    _upload_semaphore.acquire()
+     try:
+         # ── ファイル名でソート ──
+-        file_contents.sort(key=lambda x: natural_keys(x[0]))
+-        total = len(file_contents)
++        file_paths.sort(key=lambda x: natural_keys(x[0]))
++        total = len(file_paths)
+         saved_pages = []
+ 
+-        for index, (filename, content) in enumerate(file_contents):
++        for index, (filename, spool_path) in enumerate(file_paths):
+             suffix = Path(filename).suffix.lower()
+             if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+                 continue
+ 
+             update_progress(job_id, "resize", index + 1, total)
+ 
+-            raw_path = work_dir / f"raw_{index:04d}"  # 連番名にする（元のファイル名をパスに使わない）
+-            with open(raw_path, "wb") as f:
+-                f.write(content)
++            raw_path = spool_path  # 受け取り時に書き出した一時ファイルをそのまま使う
+ 
+             # リサイズ（スクランブル前）
+             with Image.open(raw_path) as img:
+@@ -544,10 +556,9 @@
+                 comic_zip.write(p, arcname=p.name)
+ 
+         # ── バンプ画像保存 ──
+-        if cover_content and cover_filename:
++        if cover_spool_path and cover_filename:
+             cover_path = user_dir / f"episode_{episode_id}_cover.jpg"
+-            suffix = Path(cover_filename).suffix.lower()
+-            with Image.open(BytesIO(cover_content)) as img:
++            with Image.open(cover_spool_path) as img:
+                 img = img.convert("RGB")
+                 img.thumbnail((600, 900), Image.LANCZOS)
+                 img.save(cover_path, "JPEG", quality=85)
+@@ -563,8 +574,11 @@
+         update_progress(job_id, "error", 0, 0, message=str(e))
+         logger.error(f"Upload error [{job_id}]: {e}")
+     finally:
++        _upload_semaphore.release()
+         if work_dir.exists():
+             shutil.rmtree(work_dir)
++        if spool_dir.exists():
++            shutil.rmtree(spool_dir)
+ 
+ # ---------------------------------------------------------------------------
+ # 作者：アップロード進捗（ポーリング用GET）
+--- a/mangaupload_yomima_site/yomima/manga.py
++++ b/mangaupload_yomima_site/yomima/manga.py
+@@ -32,6 +32,9 @@
+ CACHE_SIZE_LIMIT_MB = 270
+ IMAGES_PER_LOAD     = 1          # 1枚ずつfetch（reader.htmlのbuffer方式に合わせる）
+ MAX_DOWNLOAD_SIZE_MB = 240
++MAX_EXTRACT_ENTRY_MB = 50     # 解凍: 1エントリの上限
++MAX_EXTRACT_TOTAL_MB = 480    # 解凍: 展開合計の上限（ダウンロード上限の2倍）
++MAX_EXTRACT_FILES    = 2500   # 解凍: エントリ数の上限
+ IMAGE_EXTENSIONS    = ('.jpg', '.jpeg', '.png', '.webp', '.gif')
+ ARCHIVE_EXTENSIONS  = ('.zip', '.cbz', '.rar', '.cbr')
+ CACHE_TTL_SECONDS   = 86400 / 48  # ~30分
+@@ -207,7 +210,7 @@
+                 if not chunk:
+                     continue
+                 bytes_downloaded += len(chunk)
+-                if total_size == 0 and bytes_downloaded > max_bytes:
++                if bytes_downloaded > max_bytes:
+                     os.remove(tmp_path)
+                     return False, f"ダウンロードが {max_size_mb}MB を超えたため中止しました"
+                 f.write(chunk)
+@@ -272,35 +275,67 @@
+     warnings:    list[str] = []
+     is_rar = is_rar_archive(archive_path)
+ 
++    entry_max = MAX_EXTRACT_ENTRY_MB * 1024 * 1024
++    total_max = MAX_EXTRACT_TOTAL_MB * 1024 * 1024
++
+     try:
+         archive = rarfile.RarFile(archive_path) if is_rar else zipfile.ZipFile(archive_path)
+         with archive:
++            total_written = 0
+             for index, file_info in enumerate(archive.infolist()):
++                if index >= MAX_EXTRACT_FILES:
++                    warnings.append(f"エントリ数が上限 ({MAX_EXTRACT_FILES}) に達したため打ち切りました")
++                    break
+                 filename = file_info.filename
+                 if filename.endswith('/') or filename.endswith('\\'):
+                     continue
+-                try:
+-                    data = archive.read(file_info)
+-                except Exception as e:
+-                    warnings.append(f"読み込みスキップ: {os.path.basename(filename)} ({e})")
++                if file_info.file_size > entry_max:
++                    warnings.append(
++                        f"サイズ上限のためスキップ: {os.path.basename(filename)}"
++                        f" ({file_info.file_size / 1024 / 1024:.1f}MB)"
++                    )
+                     continue
+ 
+-                if is_valid_image(filename):
+-                    ext = os.path.splitext(
+-                        os.path.basename(filename).replace('\\', '/').split('/')[-1]
+-                    )[1].lower()
+-                else:
+-                    ext = guess_ext_from_bytes(data)
+-                    if not ext:
+-                        continue
+-
+                 try:
+-                    safe_name = get_safe_filename(filename, index, ext_override=ext)
+-                    dest      = os.path.join(extract_to, safe_name)
+-                    if not os.path.exists(dest):
++                    with archive.open(file_info) as src:
++                        head = src.read(16)
++
++                        if is_valid_image(filename):
++                            ext = os.path.splitext(
++                                os.path.basename(filename).replace('\\', '/').split('/')[-1]
++                            )[1].lower()
++                        else:
++                            ext = guess_ext_from_bytes(head)
++                            if not ext:
++                                continue
++
++                        safe_name = get_safe_filename(filename, index, ext_override=ext)
++                        dest      = os.path.join(extract_to, safe_name)
++                        if os.path.exists(dest):
++                            image_files.append(dest)
++                            continue
++
++                        written = 0
++                        chunk   = head
+                         with open(dest, 'wb') as f:
+-                            f.write(data)
+-                    image_files.append(dest)
++                            while chunk:
++                                written += len(chunk)
++                                if written > entry_max or total_written + written > total_max:
++                                    break
++                                f.write(chunk)
++                                chunk = src.read(1024 * 1024)
++
++                        if total_written + written > total_max:
++                            os.remove(dest)
++                            warnings.append(f"展開合計が上限 ({MAX_EXTRACT_TOTAL_MB}MB) に達したため打ち切りました")
++                            break
++                        if written > entry_max:
++                            os.remove(dest)
++                            warnings.append(f"サイズ上限のためスキップ: {os.path.basename(filename)}")
++                            continue
++
++                        total_written += written
++                        image_files.append(dest)
+                 except Exception as e:
+                     warnings.append(f"スキップ: {os.path.basename(filename)} ({e})")
+ 
