@@ -6,6 +6,7 @@ import time
 import shutil
 import zipfile
 import logging
+import tempfile
 import secrets
 import asyncio
 from io import BytesIO
@@ -48,7 +49,33 @@ for d in [STATIC_DIR, TMP_DIR, FINAL_ZIP_DIR]:
 # ---------------------------------------------------------------------------
 # 定数
 # ---------------------------------------------------------------------------
-SECRET_KEY                 = "MANGA_PLATFORM_SUPER_SECRET_KEY"
+INSTANCE_DIR = Path("./instance")
+
+def _load_secret_key() -> str:
+    """環境変数 MANGA_SECRET_KEY > instance/secret_key > 新規生成（0600）"""
+    env_key = os.environ.get("MANGA_SECRET_KEY", "").strip()
+    if env_key:
+        return env_key
+    key_path = INSTANCE_DIR / "secret_key"
+    if not key_path.exists():
+        INSTANCE_DIR.mkdir(parents=True, exist_ok=True)
+        # 一時ファイルに書き切ってから link で公開（公開時点で常に完成済み）
+        fd, tmp_name = tempfile.mkstemp(dir=INSTANCE_DIR, prefix=".secret_key.")  # 権限 0600
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(secrets.token_urlsafe(48))
+            try:
+                os.link(tmp_name, key_path)
+            except FileExistsError:
+                pass  # 先着の鍵を使う
+        finally:
+            os.unlink(tmp_name)
+    key = key_path.read_text().strip()
+    if not key:
+        raise RuntimeError(f"{key_path} が空です。削除して再起動するか MANGA_SECRET_KEY を設定してください")
+    return key
+
+SECRET_KEY                 = _load_secret_key()
 ALGORITHM                  = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 MAX_PAGE_SIZE_MB            = 10
@@ -60,7 +87,16 @@ MAX_COVER_SIZE_BYTES        = MAX_COVER_SIZE_MB * 1024 * 1024
 DISPLAY_MAX_SIZE            = (1200, 1800)   # アップロード時リサイズ上限
 THUMB_SIZE                  = (150, 220)     # サムネイルサイズ
 TILE_SIZE_DEFAULT           = 16             # スクランブルタイルサイズ
+ALLOWED_TILE_SIZES          = (8, 16, 32)    # UI の選択肢と同じ（閲覧側の復号もこの前提）
 CHARSET_62                  = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+def validate_tile_size(tile_size: int) -> None:
+    """tile_size が許可値でなければ 400（画面が理由を表示できるよう HTTPException で返す）"""
+    if tile_size not in ALLOWED_TILE_SIZES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"tile_size は {ALLOWED_TILE_SIZES} のいずれかにしてください（受信値: {tile_size}）",
+        )
 
 # ---------------------------------------------------------------------------
 # データベース
@@ -390,6 +426,8 @@ async def upload_manga(
     tile_size:        int  = TILE_SIZE_DEFAULT,
     current_user:     User = Depends(get_current_user),
 ):
+    validate_tile_size(tile_size)
+
     # ── バリデーション ──
     total_size = 0
     for f in files:
@@ -466,7 +504,7 @@ def _process_upload(
 
             update_progress(job_id, "resize", index + 1, total)
 
-            raw_path = work_dir / f"raw_{filename}"
+            raw_path = work_dir / f"raw_{index:04d}"  # 連番名にする（元のファイル名をパスに使わない）
             with open(raw_path, "wb") as f:
                 f.write(content)
 
@@ -541,8 +579,7 @@ async def get_upload_progress(
 ):
     progress = upload_progress.get(job_id)
     if not progress:
-        # jobが見つからない場合はdone扱い（完了後に呼ばれた場合など）
-        return {"phase": "done", "current": 0, "total": 0}
+        raise HTTPException(status_code=404, detail="job not found")
 
     # done/error の場合はストアから削除
     if progress["phase"] in ("done", "error"):
@@ -561,6 +598,8 @@ async def update_settings(
     settings:     EpisodePublishSettings,
     current_user: User = Depends(get_current_user)
 ):
+    validate_tile_size(settings.tile_size)
+
     user_dir = FINAL_ZIP_DIR / f"user_{current_user.id}" / f"title_{title_id}"
     user_dir.mkdir(parents=True, exist_ok=True)
     settings_path = user_dir / f"episode_{episode_id}_settings.json"
@@ -1165,6 +1204,8 @@ let selectedFiles = [];
 let selectedCover = null;
 let platformBaseUrl = "";
 let viewerBaseUrl   = "";
+let editScrambled = true;   // 編集中エピソードの実際のスクランブル設定（openEditModal で控える）
+let editTileSize  = 16;     // 同タイルサイズ
 
 /* ── 起動時設定取得 ── */
 async function initConfig() {
@@ -1347,6 +1388,8 @@ function openEditModal(titleId, episodeId, w) {
   document.getElementById('edit-status').value       = w.status;
   document.getElementById('edit-access').value       = w.access_level;
   document.getElementById('edit-webhook').checked    = !!w.webhook_enabled;
+  editScrambled = w.scrambled !== false;
+  editTileSize  = w.tile_size || 16;
   document.getElementById('edit-msg').textContent    = '';
   document.getElementById('edit-modal').classList.add('open');
 }
@@ -1365,7 +1408,7 @@ async function saveEdit() {
     access_level:    document.getElementById('edit-access').value,
     webhook_enabled: document.getElementById('edit-webhook').checked,
     price: 0,
-    scrambled: true, tile_size: 16, // 編集時は既存値を維持（変更不可）
+    scrambled: editScrambled, tile_size: editTileSize, // 編集では既存値を維持（変更不可）
   };
   try {
     const res  = await fetch(`/api/author/titles/${titleId}/episodes/${episodeId}/settings`, {

@@ -344,6 +344,15 @@ async def images_partial(
 # Image binary  GET /image/{session_token}/{url_hash}/{filename}
 # ---------------------------------------------------------------------------
 
+def resolve_extracted_file(url_hash: str, filename: str) -> Optional[str]:
+    """展開フォルダ直下のファイルだけ許可。外に出る名前は None"""
+    base = os.path.realpath(os.path.join(mg.get_cache_dir(), f"{url_hash}_extracted"))
+    name = os.path.basename(filename.replace("\\", "/"))
+    if not name:
+        return None
+    path = os.path.realpath(os.path.join(base, name))
+    return path if os.path.dirname(path) == base else None
+
 @app.get("/image/{session_token}/{url_hash}/{filename}")
 @limiter.limit("60/minute")
 async def serve_image(
@@ -362,8 +371,8 @@ async def serve_image(
     if url_hash != expected_hash:
         raise HTTPException(status_code=403, detail="不正なアクセスです")
 
-    path = os.path.join(mg.get_cache_dir(), f"{url_hash}_extracted", filename)
-    if not os.path.exists(path):
+    path = resolve_extracted_file(url_hash, filename)
+    if path is None or not os.path.exists(path):
         raise HTTPException(status_code=404, detail="画像が見つかりません")
 
     loop = asyncio.get_running_loop()
@@ -533,13 +542,15 @@ async def discord_send(
             return HTMLResponse("<span class='status-error'>セッションが無効です</span>")
 
     url_hash   = hashlib.md5(url.encode()).hexdigest()
-    image_path = os.path.join(mg.get_cache_dir(), f"{url_hash}_extracted", filename)
+    image_path = resolve_extracted_file(url_hash, filename)
+    if image_path is None:
+        return HTMLResponse("<span class='status-error'>不正なファイル名です</span>")
 
     webhooks = [w for w in [webhook1, webhook2] if w]
     if not webhooks:
         return HTMLResponse("<span class='status-error'>Webhookが設定されていません</span>")
 
-    errors = mg.send_image_to_discord(image_path, webhooks, filename)
+    errors = mg.send_image_to_discord(image_path, webhooks, os.path.basename(image_path))
     if errors:
         return HTMLResponse(f"<span class='status-error'>{'<br>'.join(errors)}</span>")
     return HTMLResponse("<span class='status-ok'>✓ 送信しました</span>")

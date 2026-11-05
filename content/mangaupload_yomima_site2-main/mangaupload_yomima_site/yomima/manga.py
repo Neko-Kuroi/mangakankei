@@ -458,13 +458,30 @@ def merge_manga_lists(
 # Discord Webhook
 # ---------------------------------------------------------------------------
 
+_DISCORD_WEBHOOK_HOSTS = {"discord.com", "ptb.discord.com", "canary.discord.com", "discordapp.com"}
+
+def is_discord_webhook_url(url: str) -> bool:
+    """Discord の Webhook URL（https・Discord のホスト・/api/webhooks/ 配下）だけを許可する"""
+    try:
+        p = urllib.parse.urlsplit(url)
+        port = p.port
+    except ValueError:
+        return False
+    return (
+        p.scheme == "https"
+        and (p.hostname or "") in _DISCORD_WEBHOOK_HOSTS
+        and port in (None, 443)
+        and not p.username and not p.password   # user@host 形式の偽装を拒否
+        and p.path.startswith("/api/webhooks/")
+    )
+
 def send_image_to_discord(
     image_path:   str,
     webhook_urls: list[str],
     filename:     Optional[str] = None,
 ) -> list[str]:
     if not os.path.exists(image_path):
-        return [f"ファイルが見つかりません: {image_path}"]
+        return ["ファイルが見つかりません"]   # サーバー上のパスは返さない
 
     if filename is None:
         filename = os.path.basename(image_path)
@@ -482,12 +499,16 @@ def send_image_to_discord(
     for webhook_url in webhook_urls:
         if not webhook_url:
             continue
+        if not is_discord_webhook_url(webhook_url):
+            errors.append("Webhook URL は Discord のものだけ使えます")
+            continue
         try:
             with open(image_path, 'rb') as f:
                 resp = requests.post(
                     webhook_url,
                     files={'file': (filename, f, mime)},
-                    timeout=30
+                    timeout=30,
+                    allow_redirects=False
                 )
                 resp.raise_for_status()
         except requests.exceptions.RequestException as e:
