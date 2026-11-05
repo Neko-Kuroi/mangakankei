@@ -1,0 +1,218 @@
+--- a/mangaupload_yomima_site/main.py
++++ b/mangaupload_yomima_site/main.py
+@@ -172,9 +172,17 @@
+ # ---------------------------------------------------------------------------
+ 
+ def get_client_ip(request: Request) -> str:
+-    """CloudflaredのCF-Connecting-IPヘッダーに対応したIP取得"""
+-    cf_ip = request.headers.get("CF-Connecting-IP")
+-    return cf_ip if cf_ip else (request.client.host if request.client else "unknown")
++    """レート制限用のクライアントIP取得。
++
++    原則は接続元アドレスを使う。CF-Connecting-IP はクライアントが自由に
++    書けるヘッダなので無条件には信頼せず、cloudflared の裏で動かす場合に
++    限り、環境変数 MANGA_TRUST_CF_HEADER=1 のときだけ採用する。
++    """
++    if os.environ.get("MANGA_TRUST_CF_HEADER") == "1":
++        cf_ip = request.headers.get("CF-Connecting-IP")
++        if cf_ip:
++            return cf_ip
++    return request.client.host if request.client else "unknown"
+ 
+ def natural_keys(text: str):
+     return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', text)]
+@@ -325,6 +333,21 @@
+ def get_ip_for_limit(request: Request) -> str:
+     return get_client_ip(request)
+ 
++def _is_internal_request(request: Request) -> bool:
++    """同一マシン上の内部クライアント（閲覧側など）からのリクエストかどうか。
++
++    localhost からの接続で、環境変数 MANGA_INTERNAL_TOKEN と一致する
++    X-Internal-Token ヘッダがある場合のみ内部扱いにする。
++    内部リクエストは公開カタログ・CBZ のレート制限の対象外
++    （読者全員分を代表して取得するため、IP 枠を共有させない）。
++    """
++    token = os.environ.get("MANGA_INTERNAL_TOKEN", "")
++    if not token:
++        return False
++    if not request.client or request.client.host not in ("127.0.0.1", "::1"):
++        return False
++    return secrets.compare_digest(request.headers.get("X-Internal-Token", ""), token)
++
+ limiter = Limiter(key_func=get_ip_for_limit)
+ 
+ # ---------------------------------------------------------------------------
+@@ -773,7 +796,7 @@
+ # ---------------------------------------------------------------------------
+ 
+ @app.get("/api/public/cbz/{user_id}/{title_id}/{episode_id}.cbz")
+-@limiter.limit("10/minute")
++@limiter.limit("10/minute", exempt_when=_is_internal_request)
+ async def serve_public_cbz(
+     request:    Request,
+     user_id:    int,
+@@ -840,7 +863,7 @@
+ # ---------------------------------------------------------------------------
+ 
+ @app.get("/api/public/catalog")
+-@limiter.limit("5/minute")
++@limiter.limit("5/minute", exempt_when=_is_internal_request)
+ async def public_catalog(request: Request):
+     base_url       = str(request.base_url).rstrip("/")
+     published_list = []
+--- a/mangaupload_yomima_site/yomima/main.py
++++ b/mangaupload_yomima_site/yomima/main.py
+@@ -11,6 +11,7 @@
+ 
+ import asyncio
+ import concurrent.futures
++import time
+ import hashlib
+ import os
+ import httpx
+@@ -38,6 +39,32 @@
+ 
+ PLATFORM_BASE_URL = os.environ.get("PLATFORM_BASE_URL", "http://localhost:8000")
+ 
++# ---------------------------------------------------------------------------
++# プラットフォームのカタログ取得（短時間キャッシュ＋内部トークン）
++# ---------------------------------------------------------------------------
++CATALOG_CACHE_TTL = 60  # 秒
++_catalog_cache: dict = {"ts": 0.0, "data": None}
++
++def _internal_headers() -> dict:
++    """プラットフォームへのサーバー間通信用のヘッダ（内部トークン）。"""
++    token = os.environ.get("MANGA_INTERNAL_TOKEN", "")
++    return {"X-Internal-Token": token} if token else {}
++
++async def _fetch_platform_catalog(timeout: float = 10.0) -> list:
++    """公開カタログを取得する。成功時は60秒キャッシュし、失敗時は例外を送出する。"""
++    now = time.time()
++    if _catalog_cache["data"] is not None and now - _catalog_cache["ts"] < CATALOG_CACHE_TTL:
++        return _catalog_cache["data"]
++    async with httpx.AsyncClient(timeout=timeout) as client:
++        resp = await client.get(
++            f"{PLATFORM_BASE_URL}/api/public/catalog",
++            headers=_internal_headers(),
++        )
++        resp.raise_for_status()
++        data = resp.json()
++    _catalog_cache.update({"ts": now, "data": data})
++    return data
++
+ _executor       = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+ _thumb_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+ 
+@@ -45,8 +72,16 @@
+ # IP取得（Cloudflared対応）
+ # ---------------------------------------------------------------------------
+ def get_client_ip(request: Request) -> str:
+-    cf_ip = request.headers.get("CF-Connecting-IP")
+-    return cf_ip if cf_ip else (request.client.host if request.client else "unknown")
++    """レート制限用のクライアントIP取得（プラットフォーム側と同じ規則）。
++
++    原則は接続元アドレス。CF-Connecting-IP は環境変数
++    MANGA_TRUST_CF_HEADER=1 のときだけ採用する。
++    """
++    if os.environ.get("MANGA_TRUST_CF_HEADER") == "1":
++        cf_ip = request.headers.get("CF-Connecting-IP")
++        if cf_ip:
++            return cf_ip
++    return request.client.host if request.client else "unknown"
+ 
+ # ---------------------------------------------------------------------------
+ # レート制限
+@@ -109,10 +144,7 @@
+     catalog   = []
+     error_msg = None
+     try:
+-        async with httpx.AsyncClient(timeout=10.0) as client:
+-            resp = await client.get(f"{PLATFORM_BASE_URL}/api/public/catalog")
+-            resp.raise_for_status()
+-            catalog = resp.json()
++        catalog = await _fetch_platform_catalog()
+     except Exception as e:
+         error_msg = f"カタログの取得に失敗しました: {e}"
+ 
+@@ -232,27 +264,23 @@
+     webhook_enabled = not is_platform_url   # 外部URL → True、プラットフォーム → カタログ確認後に決定
+ 
+     try:
+-        async with httpx.AsyncClient(timeout=5.0) as client:
+-            catalog_url = f"{PLATFORM_BASE_URL}/api/public/catalog"
+-            resp = await client.get(catalog_url)
+-            if resp.status_code == 200:
+-                catalog = resp.json()
+-                for item in catalog:
+-                    if item.get("cbz_url") == url:
+-                        scrambled = item.get("scrambled", False)
+-                        tile_size = item.get("tile_size", 16)
+-                        # プラットフォーム作品のみ作者設定を反映。外部URLは上書きしない。
+-                        if is_platform_url:
+-                            webhook_enabled = item.get("webhook_enabled", False)
+-                        t = item.get("title_name", "").strip()
+-                        e = item.get("episode_name", "").strip()
+-                        if t and e:
+-                            manga_title_display = f"{t} — {e}"
+-                        elif t:
+-                            manga_title_display = t
+-                        elif e:
+-                            manga_title_display = e
+-                        break
++        catalog = await _fetch_platform_catalog(timeout=5.0)
++        for item in catalog:
++            if item.get("cbz_url") == url:
++                scrambled = item.get("scrambled", False)
++                tile_size = item.get("tile_size", 16)
++                # プラットフォーム作品のみ作者設定を反映。外部URLは上書きしない。
++                if is_platform_url:
++                    webhook_enabled = item.get("webhook_enabled", False)
++                t = item.get("title_name", "").strip()
++                e = item.get("episode_name", "").strip()
++                if t and e:
++                    manga_title_display = f"{t} — {e}"
++                elif t:
++                    manga_title_display = t
++                elif e:
++                    manga_title_display = e
++                break
+     except Exception:
+         pass
+ 
+--- a/mangaupload_yomima_site/yomima/manga.py
++++ b/mangaupload_yomima_site/yomima/manga.py
+@@ -194,8 +194,14 @@
+         return True, ""
+ 
+     max_bytes = max_size_mb * 1024 * 1024
++    # 内部トークンはプラットフォーム宛ての通信にだけ付ける（外部URLへは漏らさない）
++    headers = {}
++    internal_token = os.environ.get("MANGA_INTERNAL_TOKEN", "")
++    platform_base  = os.environ.get("PLATFORM_BASE_URL", "http://localhost:8000")
++    if internal_token and url.startswith(platform_base):
++        headers["X-Internal-Token"] = internal_token
+     try:
+-        response = requests.get(url, stream=True, timeout=(10, 60))
++        response = requests.get(url, stream=True, timeout=(10, 60), headers=headers)
+         response.raise_for_status()
+         total_size = int(response.headers.get('content-length', 0))
+ 
+--- a/mangaupload_yomima_site/setup_app.py
++++ b/mangaupload_yomima_site/setup_app.py
+@@ -1,3 +1,6 @@
++# これは Colab テスト環境用の起動ハーネスです（アプリ本体ではありません）。
++# 本体の起動は uvicorn main:app を直接使ってください。
++# トンネル（bore / cloudflared）はテスト環境の都合であり、本体はトンネル非依存です。
+ import time
+ import os
+ #import hashlib
+--- a/mangaupload_yomima_site/yomima/setup_app.py
++++ b/mangaupload_yomima_site/yomima/setup_app.py
+@@ -1,3 +1,6 @@
++# これは Colab テスト環境用の起動ハーネスです（アプリ本体ではありません）。
++# 本体の起動は uvicorn main:app を直接使ってください。
++# トンネル（bore / cloudflared）はテスト環境の都合であり、本体はトンネル非依存です。
+ import time
+ import os
+ #import hashlib
