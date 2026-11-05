@@ -171,6 +171,9 @@ async def create_session(
     """
     if not mg.validate_manga_url(url):
         raise HTTPException(status_code=400, detail="無効なURL")
+    allowed, reason = mg.is_url_fetch_allowed(url)
+    if not allowed:
+        raise HTTPException(status_code=400, detail=reason)
 
     client_ip = get_client_ip(request)
     token     = mg.create_session(url, client_ip)
@@ -189,9 +192,12 @@ async def manga_add(
 ):
     manga_list, _ = mg.decode_manga_list(share) if share else ([], "")
     error: Optional[str] = None
+    fetch_allowed, fetch_reason = mg.is_url_fetch_allowed(url)
 
     if not mg.validate_manga_url(url):
         error = "URLは .zip / .cbz / .rar / .cbr である必要があります"
+    elif not fetch_allowed:
+        error = fetch_reason
     elif len(manga_list) >= mg.MAX_MANGA_COUNT:
         error = f"最大 {mg.MAX_MANGA_COUNT} 件まで登録できます"
     elif url in {m['url'] for m in manga_list}:
@@ -245,6 +251,9 @@ async def reader(
 ):
     if not mg.validate_manga_url(url):
         raise HTTPException(status_code=400, detail="無効なURL")
+    allowed, reason = mg.is_url_fetch_allowed(url)
+    if not allowed:
+        raise HTTPException(status_code=400, detail=reason)
 
     manga_list, _ = mg.decode_manga_list(share) if share else ([], "")
     manga_title   = next(
@@ -313,13 +322,16 @@ async def images_partial(
     webhook2:      str = Query(default=""),
     session_token: str = Query(default=""),
 ):
-    # セッション検証
-    if session_token:
-        session = mg.validate_session(session_token)
-        if not session:
-            raise HTTPException(status_code=403, detail="セッションが無効または期限切れです")
-        if session["cbz_url"] != url:
-            raise HTTPException(status_code=403, detail="セッションのURLが一致しません")
+    # セッション検証（必須）
+    session = mg.validate_session(session_token, get_client_ip(request))
+    if not session:
+        raise HTTPException(status_code=403, detail="セッションが無効または期限切れです")
+    if session["cbz_url"] != url:
+        raise HTTPException(status_code=403, detail="セッションのURLが一致しません")
+
+    allowed, reason = mg.is_url_fetch_allowed(url)
+    if not allowed:
+        raise HTTPException(status_code=400, detail=reason)
 
     url_hash     = hashlib.md5(url.encode()).hexdigest()
     file_ext     = os.path.splitext(url.split('?')[0])[-1].lower()
@@ -343,8 +355,7 @@ async def images_partial(
     has_more  = next_offset < total
 
     # セッションにpage_countを記録
-    if session_token:
-        mg.set_session_page_count(session_token, total)
+    mg.set_session_page_count(session_token, total)
 
     image_items = []
     for i, path in enumerate(batch, start=offset):
@@ -390,7 +401,7 @@ async def serve_image(
     filename:      str,
 ):
     # セッション検証
-    session = mg.validate_session(session_token)
+    session = mg.validate_session(session_token, get_client_ip(request))
     if not session:
         raise HTTPException(status_code=403, detail="セッションが無効または期限切れです")
 
@@ -426,7 +437,15 @@ async def serve_image(
 
 @app.get("/download/start")
 @limiter.limit("3/minute")
-async def download_start(request: Request, url: str = Query(...)):
+async def download_start(request: Request, url: str = Query(...),
+                         session_token: str = Query(default="")):
+    # セッション検証（必須）＋ URL の形式・宛先ポリシー
+    session = mg.validate_session(session_token, get_client_ip(request))
+    if not session or session["cbz_url"] != url:
+        raise HTTPException(status_code=403, detail="セッションが無効です")
+    allowed, reason = mg.is_url_fetch_allowed(url)
+    if not allowed:
+        raise HTTPException(status_code=400, detail=reason)
     file_ext     = os.path.splitext(url.split('?')[0])[-1].lower()
     archive_path = mg.get_cache_path(url) + file_ext
 
@@ -476,11 +495,15 @@ async def serve_thumbnail(
     index:         int = Query(...),
     session_token: str = Query(default=""),
 ):
-    # セッション検証
-    if session_token:
-        session = mg.validate_session(session_token)
-        if not session or session["cbz_url"] != url:
-            raise HTTPException(status_code=403, detail="セッションが無効です")
+    # セッション検証（必須）
+    session = mg.validate_session(session_token, get_client_ip(request))
+    if not session or session["cbz_url"] != url:
+        raise HTTPException(status_code=403, detail="セッションが無効です")
+
+    # 宛先ポリシー（組み立てる thumb URL は url と同一オリジンなので、これで足りる）
+    allowed, reason = mg.is_url_fetch_allowed(url)
+    if not allowed:
+        raise HTTPException(status_code=400, detail=reason)
 
     # プラットフォームのCBZ URLから thumb URLを組み立てる
     # URL形式: {platform}/api/public/cbz/{uid}/{tid}/{eid}.cbz
@@ -563,11 +586,10 @@ async def discord_send(
     webhook2: Annotated[str, Form()] = "",
     session_token: Annotated[str, Form()] = "",
 ):
-    # セッション検証
-    if session_token:
-        session = mg.validate_session(session_token)
-        if not session or session["cbz_url"] != url:
-            return HTMLResponse("<span class='status-error'>セッションが無効です</span>")
+    # セッション検証（必須）
+    session = mg.validate_session(session_token, get_client_ip(request))
+    if not session or session["cbz_url"] != url:
+        return HTMLResponse("<span class='status-error'>セッションが無効です</span>")
 
     url_hash   = hashlib.md5(url.encode()).hexdigest()
     image_path = resolve_extracted_file(url_hash, filename)

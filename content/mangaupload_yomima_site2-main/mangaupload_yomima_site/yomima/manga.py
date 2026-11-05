@@ -11,6 +11,8 @@ import os
 import zipfile
 import rarfile
 import hashlib
+import ipaddress
+import socket
 import tempfile
 import requests
 import shutil
@@ -61,10 +63,13 @@ def create_session(cbz_url: str, client_ip: str) -> str:
     _cleanup_expired_sessions()
     return token
 
-def validate_session(token: str) -> Optional[dict]:
+def validate_session(token: str, client_ip: Optional[str] = None) -> Optional[dict]:
     """
     セッションを検証して情報を返す。
     無効・期限切れの場合は None を返す。
+
+    IP 照合は環境変数 MANGA_SESSION_BIND_IP=1 のときだけ行う
+    （トンネル越し等で読者の IP が変わる環境では有効化しないこと）。
     """
     session = _session_store.get(token)
     if not session:
@@ -72,6 +77,9 @@ def validate_session(token: str) -> Optional[dict]:
     if time.time() > session["expires_at"]:
         _session_store.pop(token, None)
         return None
+    if client_ip is not None and os.environ.get("MANGA_SESSION_BIND_IP") == "1":
+        if session.get("ip") != client_ip:
+            return None
     return session
 
 def set_session_page_count(token: str, page_count: int):
@@ -194,14 +202,30 @@ def download_file(
         return True, ""
 
     max_bytes = max_size_mb * 1024 * 1024
-    # 内部トークンはプラットフォーム宛ての通信にだけ付ける（外部URLへは漏らさない）
-    headers = {}
-    internal_token = os.environ.get("MANGA_INTERNAL_TOKEN", "")
     platform_base  = os.environ.get("PLATFORM_BASE_URL", "http://localhost:8000")
-    if internal_token and url.startswith(platform_base):
-        headers["X-Internal-Token"] = internal_token
+    internal_token = os.environ.get("MANGA_INTERNAL_TOKEN", "")
     try:
-        response = requests.get(url, stream=True, timeout=(10, 60), headers=headers)
+        # リダイレクトは手動でたどり、ホップごとに宛先ポリシーを再検証する。
+        # 内部トークンはプラットフォーム宛てのときにだけ付ける（外部へ漏らさない）
+        current_url = url
+        response    = None
+        for _ in range(4):  # 初回＋リダイレクト3回まで
+            allowed, reason = fetch_policy_check(current_url)
+            if not allowed:
+                return False, reason
+            headers = {}
+            if internal_token and current_url.startswith(platform_base):
+                headers["X-Internal-Token"] = internal_token
+            response = requests.get(current_url, stream=True, timeout=(10, 60),
+                                    headers=headers, allow_redirects=False)
+            if response.status_code in (301, 302, 303, 307, 308):
+                location = response.headers.get("Location")
+                response.close()
+                if not location:
+                    return False, "リダイレクト先がありません"
+                current_url = urllib.parse.urljoin(current_url, location)
+                continue
+            break
         response.raise_for_status()
         total_size = int(response.headers.get('content-length', 0))
 
@@ -461,8 +485,90 @@ def decode_manga_list(encoded: str) -> tuple[list[dict], str]:
         return [], f"デコードエラー: {e}"
 
 def validate_manga_url(url: str) -> bool:
+    try:
+        scheme = urllib.parse.urlparse(url).scheme.lower()
+    except Exception:
+        return False
+    if scheme not in ("http", "https"):
+        return False
     ext = os.path.splitext(url.split('?')[0])[-1].lower()
     return ext in ARCHIVE_EXTENSIONS
+
+# ---------------------------------------------------------------------------
+# URL 取得ポリシー（SSRF対策）
+# ---------------------------------------------------------------------------
+
+# 「内部アドレス」の定義: ループバック／RFC1918／リンクローカル／ULA／0.0.0.0/8。
+# ipaddress の is_private は使わない（ベンチマーク用 198.18.0.0/15 等も
+# private 扱いになり、fake-ip 方式の DNS 環境で外部ホスト全てが弾かれるため）
+_BLOCKED_NETWORKS = [ipaddress.ip_network(n) for n in (
+    "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+    "169.254.0.0/16", "0.0.0.0/8", "::1/128", "fc00::/7", "fe80::/10",
+)]
+
+def _is_dangerous_ip(ip_str: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return True
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    if ip.is_multicast or ip.is_unspecified:
+        return True
+    return any(ip in net for net in _BLOCKED_NETWORKS if ip.version == net.version)
+
+def fetch_policy_check(url: str) -> tuple[bool, str]:
+    """サーバー側で取得してよい宛先かどうか（スキーム＋宛先ポリシー）。
+
+    内部アドレスは原則禁止。例外は次の2つだけ:
+    - プラットフォームのオリジン（PLATFORM_BASE_URL と一致）… 正規の連携先
+    - 環境変数 MANGA_URL_ALLOW_HOSTS に列挙したホスト名（LAN の NAS 等）
+    拡張子の判定は含まない（リダイレクト先の署名付きURL等を弾かないため）。
+    """
+    try:
+        p = urllib.parse.urlparse(url)
+        scheme = p.scheme.lower()
+        host   = (p.hostname or "").lower()
+        port   = p.port
+    except Exception:
+        return False, "無効なURLです"
+    if scheme not in ("http", "https"):
+        return False, "http/https のURLだけ取得できます"
+    if not host:
+        return False, "ホストがありません"
+
+    base = urllib.parse.urlparse(
+        os.environ.get("PLATFORM_BASE_URL", "http://localhost:8000"))
+    try:
+        base_port = base.port
+    except Exception:
+        base_port = None
+    if (scheme, host, port) == (base.scheme.lower(), (base.hostname or "").lower(), base_port):
+        return True, ""
+
+    allow_hosts = {h.strip().lower()
+                   for h in os.environ.get("MANGA_URL_ALLOW_HOSTS", "").split(",")
+                   if h.strip()}
+    if host in allow_hosts:
+        return True, ""
+
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except OSError:
+        return False, "ホストを解決できません"
+    if not infos:
+        return False, "ホストを解決できません"
+    for info in infos:
+        if _is_dangerous_ip(info[4][0]):
+            return False, "内部アドレスへの取得は許可されていません"
+    return True, ""
+
+def is_url_fetch_allowed(url: str) -> tuple[bool, str]:
+    """入口でのURL検証（形式＋宛先ポリシー）。"""
+    if not validate_manga_url(url):
+        return False, "無効なURLです"
+    return fetch_policy_check(url)
 
 def get_filename_from_url(url: str) -> str:
     filename = os.path.basename(url).split('?')[0]
