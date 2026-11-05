@@ -1,0 +1,81 @@
+--- a/main.py
++++ b/main.py
+@@ -715,6 +715,33 @@
+                         headers={"Cache-Control": "max-age=86400"})
+ 
+ # ---------------------------------------------------------------------------
++# 作者：カバー画像配信（下書き・未保存でも本人のみ）
++# ---------------------------------------------------------------------------
++
++@app.get("/api/author/cover/{title_id}/{episode_id}")
++async def author_cover(
++    title_id:   int,
++    episode_id: int,
++    token:      str,
++    db:         Session = Depends(get_db)
++):
++    try:
++        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
++        user_id = int(payload.get("sub"))
++    except JWTError:
++        raise HTTPException(status_code=401, detail="トークンが無効です")
++
++    cover_path = (
++        FINAL_ZIP_DIR / f"user_{user_id}" / f"title_{title_id}"
++        / f"episode_{episode_id}_cover.jpg"
++    )
++    if not cover_path.exists():
++        raise HTTPException(status_code=404, detail="カバー画像が見つかりません")
++
++    return FileResponse(str(cover_path), media_type="image/jpeg",
++                        headers={"Cache-Control": "max-age=86400"})
++
++# ---------------------------------------------------------------------------
+ # 公開：CBZ配信
+ # ---------------------------------------------------------------------------
+ 
+@@ -764,11 +791,12 @@
+         FINAL_ZIP_DIR / f"user_{user_id}" / f"title_{title_id}"
+         / f"episode_{episode_id}_settings.json"
+     )
+-    if settings_path.exists():
+-        with open(settings_path, "r") as f:
+-            meta = json.load(f)
+-        if meta.get("status") != "published":
+-            raise HTTPException(status_code=403, detail="非公開です")
++    if not settings_path.exists():
++        raise HTTPException(status_code=404, detail="作品が見つかりません")
++    with open(settings_path, "r") as f:
++        meta = json.load(f)
++    if meta.get("status") != "published":
++        raise HTTPException(status_code=403, detail="非公開です")
+ 
+     thumb_path = (
+         FINAL_ZIP_DIR / f"user_{user_id}" / f"title_{title_id}"
+@@ -818,6 +846,17 @@
+ 
+ @app.get("/api/public/cover/{user_id}/{title_id}/{episode_id}")
+ async def public_cover(user_id: int, title_id: int, episode_id: int):
++    settings_path = (
++        FINAL_ZIP_DIR / f"user_{user_id}" / f"title_{title_id}"
++        / f"episode_{episode_id}_settings.json"
++    )
++    if not settings_path.exists():
++        raise HTTPException(status_code=404, detail="作品が見つかりません")
++    with open(settings_path, "r") as f:
++        meta = json.load(f)
++    if meta.get("status") != "published":
++        raise HTTPException(status_code=403, detail="非公開です")
++
+     cover_path = (
+         FINAL_ZIP_DIR / f"user_{user_id}" / f"title_{title_id}"
+         / f"episode_{episode_id}_cover.jpg"
+@@ -1282,7 +1321,7 @@
+       const previewUrl   = `${platformBaseUrl}/api/author/preview/${w.title_id}/${w.episode_id}.cbz?token=${encodeURIComponent(token)}`;
+       const canPreview   = viewerBaseUrl && w.has_cbz;
+       const coverHtml    = w.has_cover
+-        ? `<img class="work-card-cover" src="${platformBaseUrl}/api/public/cover/${w.author_id}/${w.title_id}/${w.episode_id}" alt="cover">`
++        ? `<img class="work-card-cover" src="${platformBaseUrl}/api/author/cover/${w.title_id}/${w.episode_id}?token=${encodeURIComponent(token)}" alt="cover">`
+         : `<div class="work-card-cover-placeholder">📖</div>`;
+       return `
+         <div class="work-card">
