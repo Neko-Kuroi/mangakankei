@@ -175,7 +175,6 @@ class UserRegister(BaseModel):
 class EpisodePublishSettings(BaseModel):
     status:          str
     access_level:    str
-    price:           int  = 0
     title_name:      str  = ""
     episode_name:    str  = ""
     caption:         str  = ""   # 公開：作品紹介文
@@ -683,7 +682,6 @@ async def update_settings(
         existing.update({
             "status":          settings.status,
             "access_level":    settings.access_level,
-            "price":           settings.price,
             "title_name":      settings.title_name,
             "episode_name":    settings.episode_name,
             "caption":         settings.caption,
@@ -1113,7 +1111,7 @@ index_html_content = r'''<!DOCTYPE html>
       <label>アクセス権限</label>
       <select id="access_level_select">
         <option value="public">無料公開</option>
-        <option value="premium">有料会員限定</option>
+        <option value="premium">許可した人だけ読める</option>
       </select>
     </div>
   </div>
@@ -1224,7 +1222,7 @@ index_html_content = r'''<!DOCTYPE html>
         <label>アクセス権限</label>
         <select id="edit-access">
           <option value="public">無料公開</option>
-          <option value="premium">有料会員限定</option>
+          <option value="premium">許可した人だけ読める</option>
         </select>
       </div>
     </div>
@@ -1360,7 +1358,7 @@ async function loadPublishedManga() {
             <div class="catalog-sub">
               👤 ${esc(m.author_name)} &nbsp;
               <span class="badge ${m.access_level==='public'?'badge-free':'badge-premium'}">
-                ${m.access_level==='public'?'無料':'PREMIUM'}
+                ${m.access_level==='public'?'無料':'許可制'}
               </span>
             </div>
             ${m.caption ? `<div class="catalog-caption">${esc(m.caption)}</div>` : ''}
@@ -1403,7 +1401,7 @@ async function loadMyWorks() {
               <div class="work-card-sub">
                 <span class="badge ${isPublished?'badge-published':'badge-draft'}">${isPublished?'公開中':'下書き'}</span>
                 &nbsp;
-                <span class="badge ${w.access_level==='public'?'badge-free':'badge-premium'}">${w.access_level==='public'?'無料':'PREMIUM'}</span>
+                <span class="badge ${w.access_level==='public'?'badge-free':'badge-premium'}">${w.access_level==='public'?'無料':'許可制'}</span>
                 ${w.scrambled ? ' &nbsp;<span style="font-size:.72rem;color:#7c3aed">🔒 スクランブル済</span>' : ''}
                 ${!w.has_cbz  ? ' &nbsp;<span style="color:#ef4444;font-size:.75rem">⚠ CBZ未生成</span>' : ''}
                 ${isPublished ? ` &nbsp;<span style="font-size:.78rem;color:#64748b">👁 ${(w.view_count||0).toLocaleString()} views</span>` : ''}
@@ -1463,7 +1461,6 @@ async function saveEdit() {
     status:          document.getElementById('edit-status').value,
     access_level:    document.getElementById('edit-access').value,
     webhook_enabled: document.getElementById('edit-webhook').checked,
-    price: 0,
     scrambled: editScrambled, tile_size: editTileSize, // 編集では既存値を維持（変更不可）
   };
   try {
@@ -1616,7 +1613,6 @@ async function startUpload() {
         webhook_enabled: document.getElementById('webhook_enabled').checked,
         scrambled:       scramble === '1',
         tile_size:       parseInt(tileSize),
-        price: 0,
       })
     });
     if (!setRes.ok) throw new Error('設定保存失敗');

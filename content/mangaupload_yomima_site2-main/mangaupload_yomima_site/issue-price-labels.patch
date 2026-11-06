@@ -1,0 +1,83 @@
+diff a/main.py b/main.py
+--- a/main.py	2026-11-06 20:10:43.132964353 +0900
++++ b/main.py	2026-11-06 20:10:43.178176281 +0900
+@@ -175,7 +175,6 @@
+ class EpisodePublishSettings(BaseModel):
+     status:          str
+     access_level:    str
+-    price:           int  = 0
+     title_name:      str  = ""
+     episode_name:    str  = ""
+     caption:         str  = ""   # 公開：作品紹介文
+@@ -683,7 +682,6 @@
+         existing.update({
+             "status":          settings.status,
+             "access_level":    settings.access_level,
+-            "price":           settings.price,
+             "title_name":      settings.title_name,
+             "episode_name":    settings.episode_name,
+             "caption":         settings.caption,
+@@ -1113,7 +1111,7 @@
+       <label>アクセス権限</label>
+       <select id="access_level_select">
+         <option value="public">無料公開</option>
+-        <option value="premium">有料会員限定</option>
++        <option value="premium">許可した人だけ読める</option>
+       </select>
+     </div>
+   </div>
+@@ -1224,7 +1222,7 @@
+         <label>アクセス権限</label>
+         <select id="edit-access">
+           <option value="public">無料公開</option>
+-          <option value="premium">有料会員限定</option>
++          <option value="premium">許可した人だけ読める</option>
+         </select>
+       </div>
+     </div>
+@@ -1360,7 +1358,7 @@
+             <div class="catalog-sub">
+               👤 ${esc(m.author_name)} &nbsp;
+               <span class="badge ${m.access_level==='public'?'badge-free':'badge-premium'}">
+-                ${m.access_level==='public'?'無料':'PREMIUM'}
++                ${m.access_level==='public'?'無料':'許可制'}
+               </span>
+             </div>
+             ${m.caption ? `<div class="catalog-caption">${esc(m.caption)}</div>` : ''}
+@@ -1403,7 +1401,7 @@
+               <div class="work-card-sub">
+                 <span class="badge ${isPublished?'badge-published':'badge-draft'}">${isPublished?'公開中':'下書き'}</span>
+                 &nbsp;
+-                <span class="badge ${w.access_level==='public'?'badge-free':'badge-premium'}">${w.access_level==='public'?'無料':'PREMIUM'}</span>
++                <span class="badge ${w.access_level==='public'?'badge-free':'badge-premium'}">${w.access_level==='public'?'無料':'許可制'}</span>
+                 ${w.scrambled ? ' &nbsp;<span style="font-size:.72rem;color:#7c3aed">🔒 スクランブル済</span>' : ''}
+                 ${!w.has_cbz  ? ' &nbsp;<span style="color:#ef4444;font-size:.75rem">⚠ CBZ未生成</span>' : ''}
+                 ${isPublished ? ` &nbsp;<span style="font-size:.78rem;color:#64748b">👁 ${(w.view_count||0).toLocaleString()} views</span>` : ''}
+@@ -1463,7 +1461,6 @@
+     status:          document.getElementById('edit-status').value,
+     access_level:    document.getElementById('edit-access').value,
+     webhook_enabled: document.getElementById('edit-webhook').checked,
+-    price: 0,
+     scrambled: editScrambled, tile_size: editTileSize, // 編集では既存値を維持（変更不可）
+   };
+   try {
+@@ -1616,7 +1613,6 @@
+         webhook_enabled: document.getElementById('webhook_enabled').checked,
+         scrambled:       scramble === '1',
+         tile_size:       parseInt(tileSize),
+-        price: 0,
+       })
+     });
+     if (!setRes.ok) throw new Error('設定保存失敗');
+diff a/yomima/templates/public.html b/yomima/templates/public.html
+--- a/yomima/templates/public.html	2026-11-06 20:10:43.072300057 +0900
++++ b/yomima/templates/public.html	2026-11-06 20:10:43.178311323 +0900
+@@ -34,7 +34,7 @@
+           {% if item.access_level == "public" %}
+             <span style="color:var(--success);">無料</span>
+           {% else %}
+-            <span style="color:var(--accent2);">PREMIUM</span>
++            <span style="color:var(--accent2);">許可制</span>
+           {% endif %}
+           {% if item.scrambled %}
+             &nbsp;·&nbsp;<span style="color:#7c3aed;font-size:.72rem">🔒</span>
