@@ -1,0 +1,563 @@
+--- /dev/null
++++ b/tests/conftest.py
+@@ -0,0 +1,103 @@
++"""検証用 fixture。
++
++両アプリとも import 時にファイルを作る（プラットフォームは
++static/index.html の上書きと instance/secret_key の生成、DB は
++カレントディレクトリ相対）ため、サイト一式を一時ディレクトリへ
++コピーしてから別名で読み込む。
++
++実行方法は tests/README.md を参照。
++"""
++import importlib.util
++import os
++import shutil
++import sys
++from datetime import datetime, timedelta, UTC
++from pathlib import Path
++
++import pytest
++
++SITE_ROOT = Path(__file__).resolve().parent.parent
++
++
++def _load_module(name: str, path: Path):
++    spec = importlib.util.spec_from_file_location(name, path)
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[name] = module
++    spec.loader.exec_module(module)
++    return module
++
++
++@pytest.fixture(scope="session")
++def site_copy(tmp_path_factory) -> Path:
++    dst = tmp_path_factory.mktemp("site") / "site"
++    shutil.copytree(
++        SITE_ROOT, dst,
++        ignore=shutil.ignore_patterns(
++            "storage", "instance", "__pycache__", "tests", "*.patch"),
++    )
++    return dst
++
++
++@pytest.fixture(scope="session")
++def platform(site_copy):
++    # プラットフォームは ./storage 等をカレントディレクトリ相対で解決する
++    os.chdir(site_copy)
++    return _load_module("platform_main", site_copy / "main.py")
++
++
++@pytest.fixture(scope="session")
++def platform_client(platform):
++    from fastapi.testclient import TestClient
++    return TestClient(platform.app, raise_server_exceptions=False)
++
++
++@pytest.fixture(scope="session")
++def manga(site_copy):
++    return _load_module("manga", site_copy / "yomima" / "manga.py")
++
++
++@pytest.fixture(scope="session")
++def viewer(site_copy, manga):
++    return _load_module("viewer_main", site_copy / "yomima" / "main.py")
++
++
++@pytest.fixture(scope="session")
++def viewer_client(viewer):
++    from fastapi.testclient import TestClient
++    return TestClient(viewer.app, raise_server_exceptions=False)
++
++
++@pytest.fixture()
++def make_user(platform):
++    """signup エンドポイントを使わず DB へ直接ユーザーを作る。"""
++    from passlib.context import CryptContext
++    ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
++
++    def _make(username, password="password123", is_active=True):
++        db = platform.SessionLocal()
++        user = platform.User(
++            username=username,
++            email=f"{username}@example.com",
++            hashed_password=ctx.hash(password),
++            is_active=is_active,
++        )
++        db.add(user)
++        db.commit()
++        db.refresh(user)
++        db.close()
++        return user.id
++
++    return _make
++
++
++@pytest.fixture()
++def forge_token(platform):
++    """アプリ自身の秘密鍵で任意の payload のトークンを作る。"""
++    from jose import jwt as jose_jwt
++
++    def _forge(**payload):
++        body = {"exp": datetime.now(UTC) + timedelta(minutes=30)}
++        body.update(payload)
++        return jose_jwt.encode(body, platform.SECRET_KEY, algorithm=platform.ALGORITHM)
++
++    return _forge
+--- /dev/null
++++ b/tests/test_platform_auth.py
+@@ -0,0 +1,139 @@
++"""問題13-A の検証: パスワード規則、sub の形式不正、is_active。
++
++- パスワードは8文字未満と UTF-8 で72バイト超を登録時に拒否する
++- トークンの sub が数値でない・空・欠落の場合は 500 でなく 401
++- is_active=False のユーザーはログインもトークン検証も通らない
++"""
++import pytest
++
++
++@pytest.fixture(autouse=True)
++def _reset_limits(platform):
++    platform.limiter.reset()
++
++
++def signup(client, username, password):
++    return client.post("/api/auth/signup", json={
++        "username": username,
++        "email": f"{username}@example.com",
++        "password": password,
++    })
++
++
++def login(client, username, password="password123"):
++    return client.post("/api/auth/token", data={"username": username, "password": password})
++
++
++def works(client, token):
++    return client.get("/api/author/works", headers={"Authorization": f"Bearer {token}"})
++
++
++# ---------------------------------------------------------------------------
++# パスワード規則
++# ---------------------------------------------------------------------------
++
++def test_signup_rejects_short_password(platform_client):
++    r = signup(platform_client, "shorty", "a" * 7)
++    assert r.status_code == 400
++    assert "8文字以上" in r.json()["detail"]
++
++
++def test_signup_rejects_over_72_bytes(platform_client):
++    r = signup(platform_client, "longpw", "a" * 73)
++    assert r.status_code == 400
++    assert "72バイト" in r.json()["detail"]
++
++
++def test_signup_rejects_multibyte_over_72_bytes(platform_client):
++    r = signup(platform_client, "mb25", "あ" * 25)  # 25文字=75バイト
++    assert r.status_code == 400
++
++
++def test_signup_accepts_exactly_72_bytes(platform_client):
++    r = signup(platform_client, "mb24", "あ" * 24)  # 24文字=72バイト
++    assert r.status_code == 200
++    assert login(platform_client, "mb24", "あ" * 24).status_code == 200
++
++
++def test_signup_and_login_ok(platform_client):
++    assert signup(platform_client, "okuser", "a" * 8).status_code == 200
++    r = login(platform_client, "okuser", "a" * 8)
++    assert r.status_code == 200
++    assert r.json()["access_token"]
++
++
++# ---------------------------------------------------------------------------
++# is_active
++# ---------------------------------------------------------------------------
++
++def test_inactive_user_cannot_login(platform_client, make_user):
++    make_user("dis", is_active=False)
++    assert login(platform_client, "dis").status_code == 401
++
++
++def test_inactive_user_token_rejected(platform_client, make_user, forge_token):
++    uid = make_user("dis2", is_active=False)
++    assert works(platform_client, forge_token(sub=str(uid))).status_code == 401
++
++
++# ---------------------------------------------------------------------------
++# sub の形式不正（旧実装では 500 だった）
++# ---------------------------------------------------------------------------
++
++def test_non_numeric_sub_is_401(platform_client, forge_token):
++    assert works(platform_client, forge_token(sub="abc")).status_code == 401
++
++
++def test_empty_sub_is_401(platform_client, forge_token):
++    assert works(platform_client, forge_token(sub="")).status_code == 401
++
++
++def test_missing_sub_is_401(platform_client, forge_token):
++    assert works(platform_client, forge_token()).status_code == 401
++
++
++def test_unknown_user_is_401(platform_client, forge_token):
++    assert works(platform_client, forge_token(sub="99999")).status_code == 401
++
++
++def test_valid_token_works(platform_client, make_user):
++    make_user("act")
++    token = login(platform_client, "act").json()["access_token"]
++    assert works(platform_client, token).status_code == 200
++
++
++# ---------------------------------------------------------------------------
++# 手書きデコードだった3か所（preview / thumb / cover）
++# ---------------------------------------------------------------------------
++
++def test_preview_rejects_bad_sub(platform_client, forge_token):
++    r = platform_client.get("/api/author/preview/1/1.cbz",
++                            params={"token": forge_token(sub="abc")})
++    assert r.status_code == 401
++
++
++def test_preview_valid_token_passes_auth(platform_client, forge_token, make_user):
++    uid = make_user("prev")
++    r = platform_client.get("/api/author/preview/1/1.cbz",
++                            params={"token": forge_token(sub=str(uid))})
++    assert r.status_code == 404  # 認証は通過し、ファイルが無いだけ
++
++
++def test_thumb_rejects_inactive_user(platform_client, forge_token, make_user):
++    uid = make_user("dis3", is_active=False)
++    r = platform_client.get("/api/author/thumb/1/1/0",
++                            params={"token": forge_token(sub=str(uid))})
++    assert r.status_code == 401
++
++
++def test_thumb_valid_token_passes_auth(platform_client, forge_token, make_user):
++    uid = make_user("th")
++    r = platform_client.get("/api/author/thumb/1/1/0",
++                            params={"token": forge_token(sub=str(uid))})
++    assert r.status_code == 404
++
++
++def test_cover_rejects_bad_sub(platform_client, forge_token):
++    r = platform_client.get("/api/author/cover/1/1",
++                            params={"token": forge_token(sub="abc")})
++    assert r.status_code == 401
+--- /dev/null
++++ b/tests/test_viewer_session_ssrf.py
+@@ -0,0 +1,205 @@
++"""問題2・問題4 の検証: セッション必須化と SSRF 対策。
++
++- /images・/thumbnail・/discord/send・/download/start はトークン必須
++- URL は http/https のみ、内部アドレスは原則拒否
++  （プラットフォームのオリジンと環境変数の許可リストは例外）
++- リダイレクトはホップごとに宛先を再検証する
++- セッションの IP 照合は環境変数 MANGA_SESSION_BIND_IP=1 のときだけ
++"""
++import io
++import threading
++import zipfile
++from http.server import BaseHTTPRequestHandler, HTTPServer
++
++import pytest
++
++PLAT = "http://localhost:8000/api/public/cbz/1/2/3.cbz"
++
++
++@pytest.fixture(autouse=True)
++def _reset_limits(viewer):
++    viewer.limiter.reset()
++
++
++@pytest.fixture()
++def token(viewer_client):
++    r = viewer_client.get("/session", params={"url": PLAT})
++    assert r.status_code == 200
++    return r.json()["session_token"]
++
++
++# ---------------------------------------------------------------------------
++# 宛先ポリシー（単体）
++# ---------------------------------------------------------------------------
++
++def test_policy_allows_platform_url(manga):
++    assert manga.is_url_fetch_allowed(PLAT)[0]
++
++
++def test_policy_rejects_loopback(manga):
++    assert not manga.is_url_fetch_allowed("http://127.0.0.1:9999/x.cbz")[0]
++
++
++def test_policy_rejects_link_local(manga):
++    assert not manga.is_url_fetch_allowed("http://169.254.169.254/x.cbz")[0]
++
++
++def test_policy_rejects_rfc1918(manga):
++    assert not manga.is_url_fetch_allowed("http://192.168.1.5/book.cbz")[0]
++
++
++def test_policy_rejects_fake_platform_host(manga):
++    assert not manga.is_url_fetch_allowed("http://localhost:8000.evil.example/x.cbz")[0]
++
++
++def test_policy_rejects_file_scheme(manga):
++    assert not manga.validate_manga_url("file:///etc/passwd.zip")
++
++
++def test_policy_allows_public_host(manga):
++    assert manga.is_url_fetch_allowed("https://example.com/book.cbz")[0]
++
++
++def test_policy_env_allowlist(manga, monkeypatch):
++    monkeypatch.setenv("MANGA_URL_ALLOW_HOSTS", "192.168.1.5")
++    assert manga.is_url_fetch_allowed("http://192.168.1.5/book.cbz")[0]
++
++
++# ---------------------------------------------------------------------------
++# リダイレクトの再検証
++# ---------------------------------------------------------------------------
++
++@pytest.fixture(scope="module")
++def jump_server():
++    buf = io.BytesIO()
++    with zipfile.ZipFile(buf, "w") as z:
++        z.writestr("1.jpg", b"\xff\xd8\xff")
++    payload = buf.getvalue()
++
++    class Handler(BaseHTTPRequestHandler):
++        def do_GET(self):
++            if self.path == "/jump-internal.cbz":
++                self.send_response(302)
++                self.send_header("Location", "http://169.254.169.254/x.cbz")
++                self.end_headers()
++            elif self.path == "/jump-ok.cbz":
++                self.send_response(302)
++                self.send_header("Location", "/real.cbz")
++                self.end_headers()
++            elif self.path == "/real.cbz":
++                self.send_response(200)
++                self.send_header("Content-Length", str(len(payload)))
++                self.end_headers()
++                self.wfile.write(payload)
++            else:
++                self.send_response(404)
++                self.end_headers()
++
++        def log_message(self, *args):
++            pass
++
++    server = HTTPServer(("127.0.0.1", 8901), Handler)
++    threading.Thread(target=server.serve_forever, daemon=True).start()
++    yield server
++    server.shutdown()
++
++
++def test_redirect_to_internal_is_rejected(manga, jump_server, monkeypatch, tmp_path):
++    monkeypatch.setenv("MANGA_URL_ALLOW_HOSTS", "127.0.0.1")
++    ok, err = manga.download_file(
++        "http://127.0.0.1:8901/jump-internal.cbz", str(tmp_path / "a.cbz"))
++    assert not ok
++    assert "内部" in err
++
++
++def test_redirect_to_public_path_succeeds(manga, jump_server, monkeypatch, tmp_path):
++    monkeypatch.setenv("MANGA_URL_ALLOW_HOSTS", "127.0.0.1")
++    target = tmp_path / "b.cbz"
++    ok, err = manga.download_file(
++        "http://127.0.0.1:8901/jump-ok.cbz", str(target))
++    assert ok, err
++    assert target.exists()
++
++
++# ---------------------------------------------------------------------------
++# セッション必須化（HTTP）
++# ---------------------------------------------------------------------------
++
++def test_session_rejects_internal_url(viewer_client):
++    r = viewer_client.get("/session", params={"url": "http://127.0.0.1:9999/x.cbz"})
++    assert r.status_code == 400
++
++
++def test_images_requires_token(viewer_client):
++    r = viewer_client.get("/images", params={"url": PLAT})
++    assert r.status_code == 403
++
++
++def test_images_rejects_other_works_token(viewer_client, token):
++    r = viewer_client.get("/session", params={
++        "url": "http://localhost:8000/api/public/cbz/9/9/9.cbz"})
++    other = r.json()["session_token"]
++    r = viewer_client.get("/images", params={"url": PLAT, "session_token": other})
++    assert r.status_code == 403
++
++
++def test_images_accepts_valid_token(viewer_client, token):
++    r = viewer_client.get("/images", params={"url": PLAT, "session_token": token})
++    assert r.status_code == 200
++
++
++def test_thumbnail_requires_token(viewer_client):
++    r = viewer_client.get("/thumbnail", params={"url": PLAT, "index": 0})
++    assert r.status_code == 403
++
++
++def test_thumbnail_accepts_valid_token(viewer_client, token):
++    r = viewer_client.get("/thumbnail", params={
++        "url": PLAT, "index": 0, "session_token": token})
++    assert r.status_code == 404  # 認証は通過し、未キャッシュなだけ
++
++
++def test_download_requires_token(viewer_client):
++    r = viewer_client.get("/download/start", params={"url": PLAT})
++    assert r.status_code == 403
++
++
++def test_download_accepts_valid_token(viewer_client, token):
++    r = viewer_client.get("/download/start", params={
++        "url": PLAT, "session_token": token})
++    # プラットフォーム未起動のため error イベントが返る（=認証とポリシーは通過）
++    assert r.status_code == 200
++    assert "error:" in r.text
++
++
++def test_discord_send_requires_token(viewer_client):
++    r = viewer_client.post("/discord/send", data={
++        "url": PLAT, "filename": "1.jpg",
++        "webhook1": "https://discord.com/api/webhooks/1/a"})
++    assert "セッションが無効です" in r.text
++
++
++def test_reader_allows_platform_url(viewer_client):
++    r = viewer_client.get("/reader", params={"url": PLAT})
++    assert r.status_code == 200
++
++
++def test_reader_rejects_internal_url(viewer_client):
++    r = viewer_client.get("/reader", params={"url": "http://127.0.0.1:9/x.cbz"})
++    assert r.status_code == 400
++
++
++# ---------------------------------------------------------------------------
++# セッションの IP 照合（環境変数で有効化したときだけ）
++# ---------------------------------------------------------------------------
++
++def test_session_ip_binding_off_by_default(manga):
++    tok = manga.create_session(PLAT, "10.0.0.1")
++    assert manga.validate_session(tok, "10.0.0.2") is not None
++
++
++def test_session_ip_binding_when_enabled(manga, monkeypatch):
++    tok = manga.create_session(PLAT, "10.0.0.1")
++    monkeypatch.setenv("MANGA_SESSION_BIND_IP", "1")
++    assert manga.validate_session(tok, "10.0.0.2") is None
++    assert manga.validate_session(tok, "10.0.0.1") is not None
+--- /dev/null
++++ b/tests/test_internal_token.py
+@@ -0,0 +1,81 @@
++"""内部トークン（MANGA_INTERNAL_TOKEN）の送信先制限の検証。
++
++プラットフォームのオリジンにだけ送り、前方一致で偽装できるホスト
++（plat.example.com.evil.com や plat.example.com@evil.com）には送らない。
++宛先ポリシーはこのテストの対象外なので素通しにし、送信ヘッダだけを見る。
++"""
++import pytest
++
++
++class _FakeResponse:
++    status_code = 200
++    headers = {"content-length": "3"}
++
++    def raise_for_status(self):
++        pass
++
++    def iter_content(self, chunk_size=8192):
++        yield b"abc"
++
++    def close(self):
++        pass
++
++
++@pytest.fixture()
++def captured(manga, monkeypatch):
++    sent = []
++
++    def fake_get(url, **kwargs):
++        sent.append((url, kwargs.get("headers", {})))
++        return _FakeResponse()
++
++    monkeypatch.setenv("PLATFORM_BASE_URL", "https://plat.example.com")
++    monkeypatch.setenv("MANGA_INTERNAL_TOKEN", "SECRET123")
++    monkeypatch.setattr(manga, "fetch_policy_check", lambda url: (True, ""))
++    monkeypatch.setattr(manga.requests, "get", fake_get)
++    return sent
++
++
++def _token_for(manga, captured, tmp_path, name, url):
++    captured.clear()
++    target = tmp_path / name
++    ok, err = manga.download_file(url, str(target))
++    assert ok, err
++    assert captured, "リクエストが発生していません"
++    return captured[0][1].get("X-Internal-Token")
++
++
++def test_token_sent_to_platform(manga, captured, tmp_path):
++    tok = _token_for(manga, captured, tmp_path, "a.zip",
++                     "https://plat.example.com/a.zip")
++    assert tok == "SECRET123"
++
++
++def test_token_sent_to_platform_with_default_port(manga, captured, tmp_path):
++    tok = _token_for(manga, captured, tmp_path, "b.zip",
++                     "https://plat.example.com:443/a.zip")
++    assert tok == "SECRET123"
++
++
++def test_token_not_sent_to_other_host(manga, captured, tmp_path):
++    tok = _token_for(manga, captured, tmp_path, "c.zip",
++                     "https://other.example.org/a.zip")
++    assert tok is None
++
++
++def test_token_not_sent_to_suffix_spoof(manga, captured, tmp_path):
++    tok = _token_for(manga, captured, tmp_path, "d.zip",
++                     "https://plat.example.com.evil.com/a.zip")
++    assert tok is None
++
++
++def test_token_not_sent_to_userinfo_spoof(manga, captured, tmp_path):
++    tok = _token_for(manga, captured, tmp_path, "e.zip",
++                     "https://plat.example.com@evil.com/a.zip")
++    assert tok is None
++
++
++def test_token_not_sent_on_scheme_mismatch(manga, captured, tmp_path):
++    tok = _token_for(manga, captured, tmp_path, "f.zip",
++                     "http://plat.example.com/a.zip")
++    assert tok is None
+--- /dev/null
++++ b/tests/README.md
+@@ -0,0 +1,20 @@
++# テスト
++
++これまで手作業で回していた実測を pytest 化したもの。
++
++## 実行方法
++
++```bash
++pip install pytest
++python -m pytest tests/
++```
++
++サイトのルート（このフォルダの1つ上）で実行する。
++アプリは import 時にファイルを作るため、テストはサイト一式を
++一時ディレクトリへコピーしてから読み込む（元のツリーは汚れない）。
++
++## 中身
++
++- `test_platform_auth.py` — パスワード規則、トークンの sub 形式不正、is_active（問題13-A）
++- `test_viewer_session_ssrf.py` — セッション必須化、URL 宛先ポリシー、リダイレクト再検証、IP 照合（問題2・4）
++- `test_internal_token.py` — 内部トークンの送信先制限（前方一致による漏洩の回帰防止）
