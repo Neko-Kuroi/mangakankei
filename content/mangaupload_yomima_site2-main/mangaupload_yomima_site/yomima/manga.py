@@ -202,7 +202,6 @@ def download_file(
         return True, ""
 
     max_bytes = max_size_mb * 1024 * 1024
-    platform_base  = os.environ.get("PLATFORM_BASE_URL", "http://localhost:8000")
     internal_token = os.environ.get("MANGA_INTERNAL_TOKEN", "")
     try:
         # リダイレクトは手動でたどり、ホップごとに宛先ポリシーを再検証する。
@@ -214,7 +213,7 @@ def download_file(
             if not allowed:
                 return False, reason
             headers = {}
-            if internal_token and current_url.startswith(platform_base):
+            if internal_token and is_platform_origin(current_url):
                 headers["X-Internal-Token"] = internal_token
             response = requests.get(current_url, stream=True, timeout=(10, 60),
                                     headers=headers, allow_redirects=False)
@@ -518,6 +517,27 @@ def _is_dangerous_ip(ip_str: str) -> bool:
         return True
     return any(ip in net for net in _BLOCKED_NETWORKS if ip.version == net.version)
 
+def is_platform_origin(url: str) -> bool:
+    """url が PLATFORM_BASE_URL と同じオリジン（スキーム・ホスト・ポート）か。
+
+    文字列の前方一致ではなく URL を解析して比べる。前方一致だと
+    plat.example.com.evil.com や plat.example.com@evil.com も一致してしまう。
+    省略されたポートは既定値（http=80 / https=443）として扱い、userinfo 付きは認めない。
+    """
+    default_ports = {"http": 80, "https": 443}
+    try:
+        p = urllib.parse.urlparse(url)
+        b = urllib.parse.urlparse(
+            os.environ.get("PLATFORM_BASE_URL", "http://localhost:8000"))
+        if p.username or p.password:
+            return False
+        scheme, base_scheme = p.scheme.lower(), b.scheme.lower()
+        return (scheme, (p.hostname or "").lower(), p.port or default_ports.get(scheme)) == \
+               (base_scheme, (b.hostname or "").lower(), b.port or default_ports.get(base_scheme))
+    except ValueError:
+        return False
+
+
 def fetch_policy_check(url: str) -> tuple[bool, str]:
     """サーバー側で取得してよい宛先かどうか（スキーム＋宛先ポリシー）。
 
@@ -538,13 +558,7 @@ def fetch_policy_check(url: str) -> tuple[bool, str]:
     if not host:
         return False, "ホストがありません"
 
-    base = urllib.parse.urlparse(
-        os.environ.get("PLATFORM_BASE_URL", "http://localhost:8000"))
-    try:
-        base_port = base.port
-    except Exception:
-        base_port = None
-    if (scheme, host, port) == (base.scheme.lower(), (base.hostname or "").lower(), base_port):
+    if is_platform_origin(url):
         return True, ""
 
     allow_hosts = {h.strip().lower()
