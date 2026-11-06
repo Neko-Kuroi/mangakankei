@@ -70,15 +70,16 @@ def viewer_client(viewer):
 @pytest.fixture()
 def make_user(platform):
     """signup エンドポイントを使わず DB へ直接ユーザーを作る。"""
-    from passlib.context import CryptContext
-    ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
+    import bcrypt
 
     def _make(username, password="password123", is_active=True):
         db = platform.SessionLocal()
         user = platform.User(
             username=username,
             email=f"{username}@example.com",
-            hashed_password=ctx.hash(password),
+            hashed_password=bcrypt.hashpw(
+                password.encode("utf-8")[:72], bcrypt.gensalt()
+            ).decode("utf-8"),
             is_active=is_active,
         )
         db.add(user)

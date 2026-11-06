@@ -6,9 +6,8 @@ requests>=2.31.0
 Pillow>=10.3.0
 rarfile>=4.1
 natsort>=8.4.0
-passlib==1.7.4
-# passlib 1.7.4 は bcrypt 4.1 以降と非互換で、bcrypt が無い環境では
-# os_crypt にフォールバックして挙動が環境依存になるため、明示して固定する
+# パスワードハッシュ用（passlib は使わず bcrypt を直接利用する。
+# 既存の $2b$ ハッシュと互換。検証済みの版に固定する）
 bcrypt==4.0.1
 httpx
 email_validator

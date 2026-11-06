@@ -1,0 +1,153 @@
+diff a/main.py b/main.py
+--- a/main.py	2026-11-06 18:34:28.108729110 +0900
++++ b/main.py	2026-11-06 18:34:28.146760057 +0900
+@@ -20,7 +20,7 @@
+ from fastapi.middleware.cors import CORSMiddleware
+ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+ from pydantic import BaseModel, EmailStr
+-from passlib.context import CryptContext
++import bcrypt
+ from jose import jwt, JWTError
+ from PIL import Image
+ from sqlalchemy import create_engine, Column, Integer, String, Boolean
+@@ -127,7 +127,20 @@
+ # ---------------------------------------------------------------------------
+ # 認証
+ # ---------------------------------------------------------------------------
+-pwd_context   = CryptContext(schemes=["bcrypt"], deprecated="auto")
++# パスワードハッシュは bcrypt を直接使う（passlib は使わない）。
++# passlib 経由で作られた既存の $2b$ ハッシュもそのまま検証できる。
++# 72バイト超は passlib と同じく先頭72バイトで切り詰める（問題13-A 以前は
++# 72バイト超のパスワードも登録できたため。新しい bcrypt は切り詰めずに
++# エラーになるので、ここで明示する）。
++def _hash_password(password: str) -> str:
++    return bcrypt.hashpw(password.encode("utf-8")[:72], bcrypt.gensalt()).decode("utf-8")
++
++
++def _verify_password(password: str, hashed: str) -> bool:
++    try:
++        return bcrypt.checkpw(password.encode("utf-8")[:72], hashed.encode("utf-8"))
++    except ValueError:
++        return False
+ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/token")
+ 
+ def user_from_token(token: str, db: Session) -> User:
+@@ -392,7 +405,7 @@
+         raise HTTPException(400, "パスワードは8文字以上で入力してください")
+     if len(user_data.password.encode("utf-8")) > 72:
+         raise HTTPException(400, "パスワードが長すぎます（72バイトまで）")
+-    hashed_pw = pwd_context.hash(user_data.password)
++    hashed_pw = _hash_password(user_data.password)
+     db.add(User(username=user_data.username, email=user_data.email, hashed_password=hashed_pw))
+     db.commit()
+     return {"message": "ユーザー登録が完了しました。ログインしてください。"}
+@@ -405,7 +418,7 @@
+     db: Session = Depends(get_db)
+ ):
+     user = db.query(User).filter(User.username == form_data.username).first()
+-    if not user or not pwd_context.verify(form_data.password, user.hashed_password):
++    if not user or not _verify_password(form_data.password, user.hashed_password):
+         raise HTTPException(401, "ユーザー名またはパスワードが正しくありません")
+     if not user.is_active:
+         raise HTTPException(401, "ユーザー名またはパスワードが正しくありません")
+diff a/requirements.txt b/requirements.txt
+--- a/requirements.txt	2026-11-06 18:34:28.084975268 +0900
++++ b/requirements.txt	2026-11-06 18:34:28.146936032 +0900
+@@ -6,9 +6,8 @@
+ Pillow>=10.3.0
+ rarfile>=4.1
+ natsort>=8.4.0
+-passlib==1.7.4
+-# passlib 1.7.4 は bcrypt 4.1 以降と非互換で、bcrypt が無い環境では
+-# os_crypt にフォールバックして挙動が環境依存になるため、明示して固定する
++# パスワードハッシュ用（passlib は使わず bcrypt を直接利用する。
++# 既存の $2b$ ハッシュと互換。検証済みの版に固定する）
+ bcrypt==4.0.1
+ httpx
+ email_validator
+diff a/tests/conftest.py b/tests/conftest.py
+--- a/tests/conftest.py	2026-11-06 18:34:28.085027356 +0900
++++ b/tests/conftest.py	2026-11-06 18:35:21.164337969 +0900
+@@ -70,15 +70,16 @@
+ @pytest.fixture()
+ def make_user(platform):
+     """signup エンドポイントを使わず DB へ直接ユーザーを作る。"""
+-    from passlib.context import CryptContext
+-    ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
++    import bcrypt
+ 
+     def _make(username, password="password123", is_active=True):
+         db = platform.SessionLocal()
+         user = platform.User(
+             username=username,
+             email=f"{username}@example.com",
+-            hashed_password=ctx.hash(password),
++            hashed_password=bcrypt.hashpw(
++                password.encode("utf-8")[:72], bcrypt.gensalt()
++            ).decode("utf-8"),
+             is_active=is_active,
+         )
+         db.add(user)
+diff a/tests/test_passlib_compat.py b/tests/test_passlib_compat.py
+--- a/tests/test_passlib_compat.py	1970-01-01 09:00:00.000000000 +0900
++++ b/tests/test_passlib_compat.py	2026-11-06 18:34:31.713338164 +0900
+@@ -0,0 +1,59 @@
++"""passlib 脱却の互換性検証。
++
++- passlib の CryptContext が作った既存ハッシュ（$2b$）でログインできる
++- 問題13-A 以前に登録できた72バイト超のパスワードが移行後も通る
++  （passlib は先頭72バイトで切り詰めてハッシュ化していた）
++- プラットフォームが passlib を読み込まない
++
++フィクスチャのハッシュは移行前の実装（passlib 1.7.4 + bcrypt 4.0.1 の
++CryptContext(schemes=["bcrypt"])）で生成した実物。
++"""
++import sys
++
++import pytest
++
++LEGACY_HASH = "$2b$12$7zwR/NxPVbx5SdEOh5EfzOgMEtgIlFoZE0x1RpNuAe8DEzIt7dw0a"  # "legacy-pass-123"
++LEGACY_LONG_HASH = "$2b$12$iVXd8CZQdvH9cX.Q06jlzenSm7OHDm8NmoQiMat3t2G75ThKLb2jm"  # "a" * 80
++
++
++@pytest.fixture(autouse=True)
++def _reset_limits(platform):
++    platform.limiter.reset()
++
++
++def _insert_user(platform, username, hashed):
++    db = platform.SessionLocal()
++    try:
++        db.add(platform.User(
++            username=username,
++            email=f"{username}@example.com",
++            hashed_password=hashed,
++            is_active=True,
++        ))
++        db.commit()
++    finally:
++        db.close()
++
++
++def _login(client, username, password):
++    return client.post("/api/auth/token", data={"username": username, "password": password})
++
++
++def test_platform_no_longer_uses_passlib(platform):
++    assert "passlib" not in sys.modules
++    assert not hasattr(platform, "pwd_context")
++    assert platform._hash_password("x" * 8).startswith("$2b$")
++
++
++def test_legacy_passlib_hash_can_login(platform, platform_client):
++    _insert_user(platform, "legacy_user", LEGACY_HASH)
++    r = _login(platform_client, "legacy_user", "legacy-pass-123")
++    assert r.status_code == 200
++    r = _login(platform_client, "legacy_user", "wrong-password")
++    assert r.status_code == 401
++
++
++def test_legacy_long_password_can_login(platform, platform_client):
++    _insert_user(platform, "legacy_long", LEGACY_LONG_HASH)
++    r = _login(platform_client, "legacy_long", "a" * 80)
++    assert r.status_code == 200

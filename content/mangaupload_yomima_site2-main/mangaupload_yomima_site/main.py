@@ -20,7 +20,7 @@ from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr
-from passlib.context import CryptContext
+import bcrypt
 from jose import jwt, JWTError
 from PIL import Image
 from sqlalchemy import create_engine, Column, Integer, String, Boolean
@@ -127,7 +127,20 @@ def get_db() -> Generator[Session, None, None]:
 # ---------------------------------------------------------------------------
 # 認証
 # ---------------------------------------------------------------------------
-pwd_context   = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# パスワードハッシュは bcrypt を直接使う（passlib は使わない）。
+# passlib 経由で作られた既存の $2b$ ハッシュもそのまま検証できる。
+# 72バイト超は passlib と同じく先頭72バイトで切り詰める（問題13-A 以前は
+# 72バイト超のパスワードも登録できたため。新しい bcrypt は切り詰めずに
+# エラーになるので、ここで明示する）。
+def _hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8")[:72], bcrypt.gensalt()).decode("utf-8")
+
+
+def _verify_password(password: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(password.encode("utf-8")[:72], hashed.encode("utf-8"))
+    except ValueError:
+        return False
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/token")
 
 def user_from_token(token: str, db: Session) -> User:
@@ -392,7 +405,7 @@ async def signup(request: Request, user_data: UserRegister, db: Session = Depend
         raise HTTPException(400, "パスワードは8文字以上で入力してください")
     if len(user_data.password.encode("utf-8")) > 72:
         raise HTTPException(400, "パスワードが長すぎます（72バイトまで）")
-    hashed_pw = pwd_context.hash(user_data.password)
+    hashed_pw = _hash_password(user_data.password)
     db.add(User(username=user_data.username, email=user_data.email, hashed_password=hashed_pw))
     db.commit()
     return {"message": "ユーザー登録が完了しました。ログインしてください。"}
@@ -405,7 +418,7 @@ async def login(
     db: Session = Depends(get_db)
 ):
     user = db.query(User).filter(User.username == form_data.username).first()
-    if not user or not pwd_context.verify(form_data.password, user.hashed_password):
+    if not user or not _verify_password(form_data.password, user.hashed_password):
         raise HTTPException(401, "ユーザー名またはパスワードが正しくありません")
     if not user.is_active:
         raise HTTPException(401, "ユーザー名またはパスワードが正しくありません")
