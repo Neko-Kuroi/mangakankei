@@ -9,6 +9,7 @@ import time
 import base64
 import subprocess
 import shutil
+import queue
 import threading
 import sys
 import re
@@ -22,17 +23,29 @@ logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 # ログ読み取り関数は削除またはコメントアウト
-def read_process_output(process, stream, prefix=""):
-    """プロセスの出力をリアルタイムで読み取り、表示する関数"""
+def read_process_output(process, stream, prefix="", url_pattern=None, url_queue=None):
+    """プロセスの出力をリアルタイムで読み取り、表示する関数。
+
+    url_pattern と url_queue が渡された場合、その流れの唯一の読み手として
+    URL の行も探し、見つけたら url_queue へ渡す（本体は流れを直接読まない）。
+    """
     while True:
         line = stream.readline()
         if line:
             print(f"{prefix}{line.strip()}")
+            if url_pattern and url_queue:
+                match = re.search(url_pattern, line)
+                if match:
+                    url_queue.put(match.group(0).strip())
         elif process.poll() is not None:
             try:
                 remaining = stream.read()
                 if remaining:
                      print(f"{prefix}{remaining.strip()}")
+                     if url_pattern and url_queue:
+                         match = re.search(url_pattern, remaining)
+                         if match:
+                             url_queue.put(match.group(0).strip())
             except ValueError:
                  pass
             break
@@ -88,8 +101,9 @@ def setup_bore_tunnel():
                                    bufsize=1 # 行バッファリングを無効にしてリアルタイム出力を試みる
                                    )
 
-    #Boreプロセスの出力を読み取るスレッドは削除
-    bore_stdout_thread = threading.Thread(target=read_process_output, args=(bore_process, bore_process.stdout, "[BORE_OUT] "))
+    url_queue = queue.Queue()
+    bore_stdout_thread = threading.Thread(target=read_process_output, args=(bore_process, bore_process.stdout, "[BORE_OUT] "),
+                                          kwargs={"url_pattern": r'(bore\.pub:\d+)', "url_queue": url_queue})
     bore_stderr_thread = threading.Thread(target=read_process_output, args=(bore_process, bore_process.stderr, "[BORE_ERR] "))
     bore_stdout_thread.daemon = True
     bore_stderr_thread.daemon = True
@@ -104,24 +118,19 @@ def setup_bore_tunnel():
     start_time = time.time()
     timeout = 130 # タイムアウト
 
-    # Boreの標準出力からURLを読み取るループは維持（URL表示のため）
+    # URLは読み取りスレッドがキューで渡す（stdoutの読み手はスレッドだけにする）
     while time.time() - start_time < timeout:
-        line = bore_process.stdout.readline()
-        if line:
-            # print(f"Bore stdout: {line.strip()}") # デバッグ出力は削除
-            match = re.search(r'(bore\\.pub:\\d+)', line)
-            if match:
-                extracted_url_part = match.group(0).strip()
-                url = f"{extracted_url_part}"
-                url_found = True
-                break
+        try:
+            url = url_queue.get(timeout=0.5)
+            url_found = True
+            break
+        except queue.Empty:
+            pass
 
         # boreが終了したか確認（エラーになった場合など）
         if bore_process.poll() is not None:
             print("Boreプロセスが予期せず終了しました。")
             break
-
-        time.sleep(0.1) # 短い間隔で繰り返し確認
 
     if url_found:
         print(f"✅ トンネルが開始されました: {url}")
@@ -150,14 +159,7 @@ def setup_bore_tunnel():
         print("⚠️ トンネルURLの取得に失敗しました。")
         # Boreプロセスの標準出力と標準エラー出力の表示は削除
         print("Boreプロセスの標準出力と標準エラー出力を確認してください。")
-        final_stdout = bore_process.stdout.read()
-        final_stderr = bore_process.stderr.read()
-        if final_stdout:
-            print(f"最終的なBore stdout: \n{final_stdout.strip()}")
-        if final_stderr:
-            print(f"最終的なBore stderr: \n{final_stderr.strip()}")
-
-        # スレッドのjoinも不要
+        # 出力は読み取りスレッドがすべて表示済みなので、ここでは読まない
         bore_stdout_thread.join(timeout=5)
         bore_stderr_thread.join(timeout=5)
 
@@ -215,15 +217,17 @@ def setup_cloudflare_tunnel():
                                      bufsize=1)
 
     # Cloudflare Tunnelプロセスの出力を読み取るスレッドを再度有効化
+    url_queue = queue.Queue()
     tunnel_stdout_thread = threading.Thread(target=read_process_output, args=(tunnel_process, tunnel_process.stdout, "[CF_OUT] "))
-    tunnel_stderr_thread = threading.Thread(target=read_process_output, args=(tunnel_process, tunnel_process.stderr, "[CF_ERR] "))
+    tunnel_stderr_thread = threading.Thread(target=read_process_output, args=(tunnel_process, tunnel_process.stderr, "[CF_ERR] "),
+                                            kwargs={"url_pattern": r'(https:\/\/[^\s]+\.trycloudflare\.com)', "url_queue": url_queue})
     tunnel_stdout_thread.daemon = True
     tunnel_stderr_thread.daemon = True
     tunnel_stdout_thread.start()
     tunnel_stderr_thread.start()
 
 
-    # cloudflaredの出力からURLを抽出するループは維持
+    # URLは読み取りスレッドがキューで渡す（stderrの読み手はスレッドだけにする）
     url_found = False
     url = ""
     start_time = time.time()
@@ -231,24 +235,15 @@ def setup_cloudflare_tunnel():
 
     while time.time() - start_time < timeout:
         try:
-            line = tunnel_process.stderr.readline() # Cloudflare TunnelはstderrにURLを出す傾向がある
-            if line:
-                # print(f"Cloudflare Tunnel stderr: {line.strip()}") # デバッグ出力は削除
-                if 'https://' in line and 'trycloudflare.com' in line:
-                    match = re.search(r'(https:\/\/[^\s]+\.trycloudflare\.com)', line)
-                    if match:
-                        url = match.group(0).strip()
-                        url_found = True
-                        break
-        except Exception as e:
-            print(f"Error reading Cloudflare Tunnel stderr: {e}")
+            url = url_queue.get(timeout=0.5)
+            url_found = True
+            break
+        except queue.Empty:
             pass
 
         if tunnel_process.poll() is not None:
             print("Cloudflare Tunnelプロセスが予期せず終了しました。")
             break
-
-        time.sleep(0.1)
 
     if url_found:
         print(f"✅ Cloudflare トンネルが開始されました: {url}")
@@ -257,14 +252,7 @@ def setup_cloudflare_tunnel():
         print("⚠️ CloudflareトンネルURLの取得に失敗しました。")
         # Cloudflare Tunnelプロセスの標準出力と標準エラー出力の表示は削除
         print("Cloudflare Tunnelプロセスの標準出力と標準エラー出力を確認してください。")
-        final_stdout = tunnel_process.stdout.read()
-        final_stderr = tunnel_process.stderr.read()
-        if final_stdout:
-            print(f"最終的なCloudflare Tunnel stdout: \n{final_stdout.strip()}")
-        if final_stderr:
-            print(f"最終的なCloudflare Tunnel stderr: \n{final_stderr.strip()}")
-
-        # スレッドのjoinも不要
+        # 出力は読み取りスレッドがすべて表示済みなので、ここでは読まない
         tunnel_stdout_thread.join(timeout=5)
         tunnel_stderr_thread.join(timeout=5)
 
