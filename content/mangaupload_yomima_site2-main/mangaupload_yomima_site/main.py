@@ -41,10 +41,9 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # ディレクトリ準備
 # ---------------------------------------------------------------------------
-STATIC_DIR    = Path("./static")
 TMP_DIR       = Path("./storage/tmp")
 FINAL_ZIP_DIR = Path("./storage/zips")
-for d in [STATIC_DIR, TMP_DIR, FINAL_ZIP_DIR]:
+for d in [TMP_DIR, FINAL_ZIP_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
@@ -950,8 +949,9 @@ async def get_config(request: Request):
 
 @app.get("/", response_class=HTMLResponse)
 async def read_root():
-    with open(STATIC_DIR / "index.html", "r", encoding="utf-8") as f:
-        return f.read()
+    # 画面は直下の埋め込み文字列が正本（単一ファイル配布のため）。
+    # ファイルは経由しない。
+    return index_html_content
 
 # ---------------------------------------------------------------------------
 # UI HTML
@@ -1682,6 +1682,3 @@ loadPublishedManga();
 </body>
 </html>
 '''
-
-with open(STATIC_DIR / "index.html", "w", encoding="utf-8") as f:
-    f.write(index_html_content)
