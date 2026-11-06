@@ -25,6 +25,20 @@
         <a href="/"       id="nav-mylist" class="btn btn-sm btn-ghost">📚 マイリスト</a>
       </nav>
     </div>
+    <div style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;padding:.45rem 0;font-size:.85rem">
+      <span style="color:#94a3b8">読者アカウント:</span>
+      <span id="auth-state">確認中…</span>
+      <span id="auth-forms" style="display:none;gap:.4rem;align-items:center;flex-wrap:wrap">
+        <input class="input" id="auth-user" type="text" placeholder="ユーザー名" style="width:9rem">
+        <input class="input" id="auth-email" type="email" placeholder="メール（登録時のみ）" style="width:11rem">
+        <input class="input" id="auth-pass" type="password" placeholder="パスワード" style="width:9rem">
+        <button class="btn btn-sm btn-primary" onclick="viewerLogin()">ログイン</button>
+        <button class="btn btn-sm btn-ghost" onclick="viewerRegister()">新規登録</button>
+      </span>
+      <button id="auth-logout" class="btn btn-sm btn-ghost" style="display:none" onclick="viewerLogout()">ログアウト</button>
+      <button id="auth-declare" class="btn btn-sm btn-ghost" style="display:none" onclick="viewerDeclareAdult()">年齢申告（18歳以上）</button>
+      <span id="auth-msg" style="color:#dc2626"></span>
+    </div>
   </div>
 </header>
 
@@ -32,5 +46,85 @@
   {% block content %}{% endblock %}
 </main>
 
+<script>
+function authMsg(text) { document.getElementById('auth-msg').textContent = text || ''; }
+async function refreshAuthArea() {
+  const state = document.getElementById('auth-state');
+  const forms = document.getElementById('auth-forms');
+  const logoutBtn = document.getElementById('auth-logout');
+  const declareBtn = document.getElementById('auth-declare');
+  try {
+    const r = await fetch('/auth/me');
+    if (r.ok) {
+      const me = await r.json();
+      state.textContent = '👤 ' + me.username + ' でログイン中';
+      forms.style.display = 'none';
+      logoutBtn.style.display = '';
+      declareBtn.style.display = '';
+      if (me.adult_declared_at) {
+        declareBtn.textContent = '年齢申告済み';
+        declareBtn.disabled = true;
+      } else {
+        declareBtn.textContent = '年齢申告（18歳以上）';
+        declareBtn.disabled = false;
+      }
+    } else {
+      state.textContent = '未ログイン';
+      forms.style.display = 'inline-flex';
+      logoutBtn.style.display = 'none';
+      declareBtn.style.display = 'none';
+    }
+  } catch(e) {
+    state.textContent = '';
+    forms.style.display = 'inline-flex';
+  }
+}
+async function postAuth(path, fields) {
+  const fd = new FormData();
+  for (const k in fields) fd.append(k, fields[k]);
+  const r = await fetch(path, { method: 'POST', body: fd });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.detail || '失敗しました');
+  return d;
+}
+async function viewerLogin() {
+  authMsg('');
+  try {
+    await postAuth('/auth/login', {
+      username: document.getElementById('auth-user').value,
+      password: document.getElementById('auth-pass').value,
+    });
+    location.reload();
+  } catch(e) { authMsg(e.message); }
+}
+async function viewerRegister() {
+  authMsg('');
+  const email = document.getElementById('auth-email').value.trim();
+  if (!email) { authMsg('登録にはメールアドレスも入力してください'); return; }
+  try {
+    await postAuth('/auth/register', {
+      username: document.getElementById('auth-user').value,
+      email: email,
+      password: document.getElementById('auth-pass').value,
+    });
+    location.reload();
+  } catch(e) { authMsg(e.message); }
+}
+async function viewerDeclareAdult() {
+  authMsg('');
+  try {
+    const r = await fetch('/auth/declare-adult', { method: 'POST' });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.detail || '年齢申告に失敗しました');
+    authMsg('年齢申告を記録しました');
+    refreshAuthArea();
+  } catch(e) { authMsg(e.message); }
+}
+async function viewerLogout() {
+  try { await fetch('/auth/logout', { method: 'POST' }); } catch(e) {}
+  location.reload();
+}
+refreshAuthArea();
+</script>
 </body>
 </html>

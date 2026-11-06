@@ -33,8 +33,13 @@
           &nbsp;·&nbsp;
           {% if item.access_level == "public" %}
             <span style="color:var(--success);">無料</span>
+          {% elif (item.author_id, item.title_id) in entitled %}
+            <span style="color:var(--success);">許可制・読めます</span>
           {% else %}
-            <span style="color:var(--accent2);">許可制</span>
+            <span style="color:var(--accent2);">🔒 許可制</span>
+          {% endif %}
+          {% if item.age_restricted %}
+            &nbsp;·&nbsp;<span style="color:#dc2626;font-size:.72rem">🔞 年齢確認</span>
           {% endif %}
           {% if item.scrambled %}
             &nbsp;·&nbsp;<span style="color:#7c3aed;font-size:.72rem">🔒</span>

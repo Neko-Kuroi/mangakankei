@@ -49,8 +49,15 @@ SESSION_TTL_SECONDS = 3600        # セッション有効期限1時間
 # { session_token: { cbz_url, created_at, expires_at, ip, page_count } }
 _session_store: dict[str, dict] = {}
 
-def create_session(cbz_url: str, client_ip: str) -> str:
-    """セッショントークンを発行する"""
+def create_session(cbz_url: str, client_ip: str,
+                   unlock_user_id=None, auth_token=None,
+                   age_verified: bool = False) -> str:
+    """セッショントークンを発行する。
+
+    unlock_user_id / auth_token は許可制（premium）作品用：このセッションで
+    ページを返してよい読者のユーザーIDと、CBZ 取得に使うその読者の
+    プラットフォームトークン（サーバー側だけに保持し、ブラウザには渡さない）。
+    """
     token = secrets.token_urlsafe(32)   # 推測不可能な43文字
     now   = time.time()
     _session_store[token] = {
@@ -59,6 +66,9 @@ def create_session(cbz_url: str, client_ip: str) -> str:
         "expires_at": now + SESSION_TTL_SECONDS,
         "ip":         client_ip,
         "page_count": None,   # 初回アクセス時に確定
+        "unlock_user_id": unlock_user_id,
+        "auth_token":     auth_token,
+        "age_verified":   age_verified,
     }
     _cleanup_expired_sessions()
     return token
@@ -197,6 +207,8 @@ def download_file(
     save_path: str,
     max_size_mb: int = MAX_DOWNLOAD_SIZE_MB,
     progress_callback=None,
+    auth_token: str = None,
+    age_verified: bool = False,
 ) -> tuple[bool, str]:
     if os.path.exists(save_path):
         return True, ""
@@ -215,6 +227,12 @@ def download_file(
             headers = {}
             if internal_token and is_platform_origin(current_url):
                 headers["X-Internal-Token"] = internal_token
+            if auth_token and is_platform_origin(current_url):
+                # 許可制作品の取得用：読者本人のトークン（プラットフォーム宛てのみ）
+                headers["Authorization"] = f"Bearer {auth_token}"
+            if age_verified and is_platform_origin(current_url):
+                # 年齢ゲート通過済みの取得であることをプラットフォームへ伝える
+                headers["X-Age-Verified"] = "1"
             response = requests.get(current_url, stream=True, timeout=(10, 60),
                                     headers=headers, allow_redirects=False)
             if response.status_code in (301, 302, 303, 307, 308):

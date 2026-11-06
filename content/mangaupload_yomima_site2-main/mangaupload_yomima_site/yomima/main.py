@@ -14,6 +14,7 @@ import html
 import concurrent.futures
 import time
 import hashlib
+import secrets
 import os
 import httpx
 from contextlib import asynccontextmanager
@@ -21,7 +22,7 @@ from typing import Annotated, Optional
 
 import urllib.parse
 from fastapi import FastAPI, Form, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from slowapi import Limiter
@@ -111,6 +112,202 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return StarletteResponse("リクエストが多すぎます。しばらく待ってから再試行してください。", status_code=429)
 
+
+# ---------------------------------------------------------------------------
+# 読者アカウント（プラットフォームの JWT はサーバー側だけに保持）
+# ---------------------------------------------------------------------------
+AUTH_TTL_SECONDS = 3600  # プラットフォームのトークン有効期限（60分）に合わせる
+_auth_store: dict = {}   # {cookie_token: {platform_token, user_id, username, expires_at}}
+_grants_cache: dict = {} # {user_id: (取得時刻, {(author_id, title_id)})}
+
+
+def _current_reader(request: Request):
+    """ログイン中の読者を返す（未ログイン・期限切れは None）。"""
+    token = request.cookies.get("viewer_auth", "")
+    entry = _auth_store.get(token)
+    if not entry:
+        return None
+    if time.time() > entry["expires_at"]:
+        _auth_store.pop(token, None)
+        return None
+    return entry
+
+
+async def _platform_login(username: str, password: str):
+    """プラットフォームでログインし (platform_token, me) を返す。"""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(
+            f"{PLATFORM_BASE_URL}/api/auth/token",
+            data={"username": username, "password": password},
+        )
+        if resp.status_code != 200:
+            raise HTTPException(status_code=401, detail="ユーザー名またはパスワードが正しくありません")
+        platform_token = resp.json()["access_token"]
+        me_resp = await client.get(
+            f"{PLATFORM_BASE_URL}/api/auth/me",
+            headers={"Authorization": f"Bearer {platform_token}"},
+        )
+        if me_resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="プラットフォームとの通信に失敗しました")
+        return platform_token, me_resp.json()
+
+
+def _start_auth_session(platform_token: str, me: dict) -> JSONResponse:
+    cookie_token = secrets.token_urlsafe(32)
+    _auth_store[cookie_token] = {
+        "platform_token": platform_token,
+        "user_id":        me["id"],
+        "username":       me["username"],
+        "expires_at":     time.time() + AUTH_TTL_SECONDS,
+    }
+    resp = JSONResponse({"username": me["username"]})
+    resp.set_cookie("viewer_auth", cookie_token, max_age=AUTH_TTL_SECONDS,
+                    httponly=True, path="/", samesite="lax")
+    return resp
+
+
+@app.post("/auth/login")
+async def auth_login(username: str = Form(...), password: str = Form(...)):
+    platform_token, me = await _platform_login(username, password)
+    return _start_auth_session(platform_token, me)
+
+
+@app.post("/auth/register")
+async def auth_register(username: str = Form(...), email: str = Form(...),
+                        password: str = Form(...)):
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(
+            f"{PLATFORM_BASE_URL}/api/auth/signup",
+            json={"username": username, "email": email, "password": password,
+                  "account_type": "reader"},
+        )
+        if resp.status_code != 200:
+            try:
+                detail = resp.json().get("detail", "登録に失敗しました")
+            except Exception:
+                detail = "登録に失敗しました"
+            raise HTTPException(status_code=400, detail=detail)
+    platform_token, me = await _platform_login(username, password)
+    return _start_auth_session(platform_token, me)
+
+
+@app.post("/auth/logout")
+async def auth_logout(request: Request):
+    _auth_store.pop(request.cookies.get("viewer_auth", ""), None)
+    resp = JSONResponse({"status": "logged_out"})
+    resp.delete_cookie("viewer_auth", path="/")
+    return resp
+
+
+@app.get("/auth/me")
+async def auth_me(request: Request):
+    reader = _current_reader(request)
+    if reader is None:
+        raise HTTPException(status_code=401, detail="ログインしていません")
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(
+            f"{PLATFORM_BASE_URL}/api/auth/me",
+            headers={"Authorization": f"Bearer {reader['platform_token']}"},
+        )
+    if resp.status_code == 401:
+        _auth_store.pop(request.cookies.get("viewer_auth", ""), None)
+        raise HTTPException(status_code=401, detail="ログインの有効期限が切れました")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail="プラットフォームとの通信に失敗しました")
+    return resp.json()
+
+
+async def _fetch_my_grants(reader: dict) -> set:
+    """ログイン中読者に許可が出ている (author_id, title_id) の集合（60秒キャッシュ）。"""
+    now = time.time()
+    cached = _grants_cache.get(reader["user_id"])
+    if cached and now - cached[0] < CATALOG_CACHE_TTL:
+        return cached[1]
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(
+            f"{PLATFORM_BASE_URL}/api/auth/grants",
+            headers={"Authorization": f"Bearer {reader['platform_token']}"},
+        )
+        resp.raise_for_status()
+        grants = {(g["author_id"], g["title_id"]) for g in resp.json()}
+    _grants_cache[reader["user_id"]] = (now, grants)
+    return grants
+
+
+def _enforce_session_unlock(request: Request, session: dict) -> None:
+    """許可制セッションは、unlock した読者本人だけが使える。"""
+    uid = session.get("unlock_user_id")
+    if uid is None:
+        return
+    reader = _current_reader(request)
+    if reader is None or reader["user_id"] != uid:
+        raise HTTPException(status_code=403, detail="この作品を読む権限がありません")
+
+
+# ---------------------------------------------------------------------------
+# 年齢確認（無料の年齢対象作品はセッション単位の自己申告ゲート、
+# ログイン中はアカウントの年齢申告と連携する。どちらも自己申告）
+# ---------------------------------------------------------------------------
+AGE_GATE_TTL_SECONDS = 30 * 24 * 3600  # 30日
+_age_gate_store: dict = {}  # {cookie_token: expires_at}
+
+
+def _age_gate_ok(request: Request) -> bool:
+    """匿名読者の年齢ゲート（自己申告）を通過済みか。"""
+    token = request.cookies.get("age_gate", "")
+    exp = _age_gate_store.get(token)
+    if not exp:
+        return False
+    if time.time() > exp:
+        _age_gate_store.pop(token, None)
+        return False
+    return True
+
+
+@app.post("/age/declare")
+@limiter.limit("10/minute")
+async def age_declare(request: Request):
+    """匿名読者の年齢申告（自己申告）。この端末では30日間有効。"""
+    token = secrets.token_urlsafe(32)
+    _age_gate_store[token] = time.time() + AGE_GATE_TTL_SECONDS
+    resp = JSONResponse({"status": "declared"})
+    resp.set_cookie("age_gate", token, max_age=AGE_GATE_TTL_SECONDS,
+                    httponly=True, path="/", samesite="lax")
+    return resp
+
+
+async def _fetch_me(reader: dict):
+    """プラットフォーム上の自分の情報を返す（失敗時は None）。"""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{PLATFORM_BASE_URL}/api/auth/me",
+                headers={"Authorization": f"Bearer {reader['platform_token']}"},
+            )
+        return resp.json() if resp.status_code == 200 else None
+    except Exception:
+        return None
+
+
+@app.post("/auth/declare-adult")
+async def auth_declare_adult(request: Request):
+    """ログイン中アカウントの年齢申告をプラットフォームに記録する。"""
+    reader = _current_reader(request)
+    if reader is None:
+        raise HTTPException(status_code=401, detail="ログインしていません")
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(
+            f"{PLATFORM_BASE_URL}/api/auth/declare-adult",
+            headers={"Authorization": f"Bearer {reader['platform_token']}"},
+        )
+    if resp.status_code == 401:
+        _auth_store.pop(request.cookies.get("viewer_auth", ""), None)
+        raise HTTPException(status_code=401, detail="ログインの有効期限が切れました")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail="プラットフォームとの通信に失敗しました")
+    return resp.json()
+
+
 # ---------------------------------------------------------------------------
 # List screen  GET /
 # ---------------------------------------------------------------------------
@@ -149,11 +346,21 @@ async def public_catalog(request: Request):
     except Exception as e:
         error_msg = f"カタログの取得に失敗しました: {e}"
 
+    reader   = _current_reader(request)
+    entitled = set()
+    if reader is not None:
+        try:
+            entitled = await _fetch_my_grants(reader)
+        except Exception:
+            entitled = set()
+
     return templates.TemplateResponse(request, "public.html", {
         "request":      request,
         "catalog":      catalog,
         "error_msg":    error_msg,
         "platform_url": PLATFORM_BASE_URL,
+        "entitled":     entitled,
+        "reader_user":  reader,
     })
 
 # ---------------------------------------------------------------------------
@@ -177,7 +384,39 @@ async def create_session(
         raise HTTPException(status_code=400, detail=reason)
 
     client_ip = get_client_ip(request)
-    token     = mg.create_session(url, client_ip)
+
+    # 許可制（premium）のプラットフォーム作品は、ログイン中読者のセッションに
+    # bind する（CBZ 取得にはその読者のトークンを併送し、ページ配信は本人だけ）
+    if "/api/public/cbz/" in url:
+        entry = None
+        try:
+            catalog = await _fetch_platform_catalog(timeout=5.0)
+            entry = next((i for i in catalog if i.get("cbz_url") == url), None)
+        except Exception:
+            entry = None
+        if entry is not None and entry.get("access_level") == "premium":
+            reader = _current_reader(request)
+            if reader is None:
+                raise HTTPException(status_code=401, detail="この作品を読むにはログインが必要です")
+            token = mg.create_session(url, client_ip,
+                                      unlock_user_id=reader["user_id"],
+                                      auth_token=reader["platform_token"])
+            return {"session_token": token, "expires_in": mg.SESSION_TTL_SECONDS}
+        if entry is not None and entry.get("age_restricted"):
+            # 年齢対象の無料作品：ログイン中はアカウント申告、匿名は年齢ゲート
+            reader = _current_reader(request)
+            if reader is not None:
+                me = await _fetch_me(reader)
+                if me is not None and me.get("adult_declared_at"):
+                    token = mg.create_session(url, client_ip, age_verified=True)
+                    return {"session_token": token, "expires_in": mg.SESSION_TTL_SECONDS}
+                raise HTTPException(status_code=403, detail="年齢対象の作品です。先に年齢申告をしてください")
+            if _age_gate_ok(request):
+                token = mg.create_session(url, client_ip, age_verified=True)
+                return {"session_token": token, "expires_in": mg.SESSION_TTL_SECONDS}
+            raise HTTPException(status_code=403, detail="年齢対象の作品です。年齢確認をしてください")
+
+    token = mg.create_session(url, client_ip)
     return {"session_token": token, "expires_in": mg.SESSION_TTL_SECONDS}
 
 # ---------------------------------------------------------------------------
@@ -272,6 +511,8 @@ async def reader(
     # プラットフォーム公開作品（/api/public/cbz/）のみ作者の webhook_enabled 設定に従う。
     is_platform_url = "/api/public/cbz/" in url
     webhook_enabled = not is_platform_url   # 外部URL → True、プラットフォーム → カタログ確認後に決定
+    is_premium      = False
+    is_age          = False
 
     try:
         catalog = await _fetch_platform_catalog(timeout=5.0)
@@ -282,6 +523,8 @@ async def reader(
                 # プラットフォーム作品のみ作者設定を反映。外部URLは上書きしない。
                 if is_platform_url:
                     webhook_enabled = item.get("webhook_enabled", False)
+                    is_premium      = item.get("access_level") == "premium"
+                    is_age          = bool(item.get("age_restricted"))
                 t = item.get("title_name", "").strip()
                 e = item.get("episode_name", "").strip()
                 if t and e:
@@ -294,6 +537,12 @@ async def reader(
     except Exception:
         pass
 
+    reader = _current_reader(request)
+    age_gate_passed = _age_gate_ok(request)
+    if is_age and not age_gate_passed and reader is not None:
+        me = await _fetch_me(reader)
+        age_gate_passed = bool(me and me.get("adult_declared_at"))
+
     return templates.TemplateResponse(request, "reader.html", {
         "request":         request,
         "manga_url":       url,
@@ -305,6 +554,10 @@ async def reader(
         "scrambled":       scrambled,
         "tile_size":       tile_size,
         "webhook_enabled": webhook_enabled,
+        "is_premium":      is_premium,
+        "is_age_restricted": is_age,
+        "age_gate_passed": age_gate_passed,
+        "reader_logged_in": reader is not None,
     })
 
 # ---------------------------------------------------------------------------
@@ -329,6 +582,7 @@ async def images_partial(
         raise HTTPException(status_code=403, detail="セッションが無効または期限切れです")
     if session["cbz_url"] != url:
         raise HTTPException(status_code=403, detail="セッションのURLが一致しません")
+    _enforce_session_unlock(request, session)
 
     allowed, reason = mg.is_url_fetch_allowed(url)
     if not allowed:
@@ -410,6 +664,7 @@ async def serve_image(
     expected_hash = hashlib.md5(session["cbz_url"].encode()).hexdigest()
     if url_hash != expected_hash:
         raise HTTPException(status_code=403, detail="不正なアクセスです")
+    _enforce_session_unlock(request, session)
 
     path = resolve_extracted_file(url_hash, filename)
     if path is None or not os.path.exists(path):
@@ -444,6 +699,7 @@ async def download_start(request: Request, url: str = Query(...),
     session = mg.validate_session(session_token, get_client_ip(request))
     if not session or session["cbz_url"] != url:
         raise HTTPException(status_code=403, detail="セッションが無効です")
+    _enforce_session_unlock(request, session)
     allowed, reason = mg.is_url_fetch_allowed(url)
     if not allowed:
         raise HTTPException(status_code=400, detail=reason)
@@ -462,7 +718,9 @@ async def download_start(request: Request, url: str = Query(...),
             loop.call_soon_threadsafe(queue.put_nowait, p)
 
         def run_download():
-            success, err = mg.download_file(url, archive_path, progress_callback=progress_cb)
+            success, err = mg.download_file(url, archive_path, progress_callback=progress_cb,
+                                            auth_token=session.get("auth_token"),
+                                            age_verified=bool(session.get("age_verified")))
             if success:
                 loop.call_soon_threadsafe(queue.put_nowait, "done")
             else:
@@ -500,6 +758,7 @@ async def serve_thumbnail(
     session = mg.validate_session(session_token, get_client_ip(request))
     if not session or session["cbz_url"] != url:
         raise HTTPException(status_code=403, detail="セッションが無効です")
+    _enforce_session_unlock(request, session)
 
     # 宛先ポリシー（組み立てる thumb URL は url と同一オリジンなので、これで足りる）
     allowed, reason = mg.is_url_fetch_allowed(url)
@@ -536,8 +795,14 @@ async def serve_thumbnail(
 
     if thumb_url:
         try:
+            headers = _internal_headers()
+            if session.get("auth_token") and "/api/public/thumb/" in thumb_url:
+                # 許可制のサムネイルはプラットフォーム側でも読者トークンが要る
+                headers["Authorization"] = f"Bearer {session['auth_token']}"
+            if session.get("age_verified") and "/api/public/thumb/" in thumb_url:
+                headers["X-Age-Verified"] = "1"
             async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(thumb_url)
+                resp = await client.get(thumb_url, headers=headers)
                 if resp.status_code == 200:
                     return Response(
                         content=resp.content,

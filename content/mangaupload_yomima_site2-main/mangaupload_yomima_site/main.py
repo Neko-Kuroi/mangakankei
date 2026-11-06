@@ -23,7 +23,7 @@ from pydantic import BaseModel, EmailStr
 import bcrypt
 from jose import jwt, JWTError
 from PIL import Image
-from sqlalchemy import create_engine, Column, Integer, String, Boolean
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, UniqueConstraint
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -113,8 +113,50 @@ class User(Base):
     email           = Column(String,  unique=True, index=True, nullable=False)
     hashed_password = Column(String,  nullable=False)
     is_active       = Column(Boolean, default=True)
+    # author=作家用 / reader=読むためだけのアカウント（アップロード不可）
+    account_type    = Column(String,  default="author")
+    # 年齢確認の自己申告をした日時（NULL=未申告）
+    adult_declared_at = Column(DateTime, nullable=True)
+
+class Grant(Base):
+    """作家が読者へ出す作品（title）単位の閲覧許可。"""
+    __tablename__ = "grants"
+    id         = Column(Integer, primary_key=True, index=True)
+    author_id  = Column(Integer, index=True, nullable=False)
+    title_id   = Column(Integer, index=True, nullable=False)
+    user_id    = Column(Integer, index=True, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(UTC))
+    __table_args__ = (UniqueConstraint("author_id", "title_id", "user_id"),)
+
+class Suspension(Base):
+    """管理者による作品（title）単位の公開停止。lifted_at が NULL の行が有効。"""
+    __tablename__ = "suspensions"
+    id           = Column(Integer, primary_key=True, index=True)
+    author_id    = Column(Integer, index=True, nullable=False)
+    title_id     = Column(Integer, index=True, nullable=False)
+    reason       = Column(String,  default="")
+    suspended_by = Column(Integer, nullable=False)
+    created_at   = Column(DateTime, default=lambda: datetime.now(UTC))
+    lifted_at    = Column(DateTime, nullable=True)
 
 Base.metadata.create_all(bind=engine)
+
+
+def _migrate_users_columns() -> None:
+    """既存 DB の users テーブルに後付けの列が無ければ足す（create_all は
+    既存テーブルを変更しないため）。新規 DB では何もしない。"""
+    from sqlalchemy import inspect, text
+    cols = {c["name"] for c in inspect(engine).get_columns("users")}
+    with engine.begin() as conn:
+        if "account_type" not in cols:
+            conn.execute(text(
+                "ALTER TABLE users ADD COLUMN account_type VARCHAR DEFAULT 'author'"))
+        if "adult_declared_at" not in cols:
+            conn.execute(text(
+                "ALTER TABLE users ADD COLUMN adult_declared_at DATETIME"))
+
+
+_migrate_users_columns()
 
 def get_db() -> Generator[Session, None, None]:
     db = SessionLocal()
@@ -164,6 +206,97 @@ def get_current_user(
 ) -> User:
     return user_from_token(token, db)
 
+
+def get_current_author(current_user: User = Depends(get_current_user)) -> User:
+    """作者系エンドポイント用。reader アカウントは使えない。"""
+    if current_user.account_type == "reader":
+        raise HTTPException(status_code=403, detail="読者アカウントでは利用できません")
+    return current_user
+
+
+def is_admin(user: User) -> bool:
+    """管理者は環境変数 MANGA_ADMIN_USERS（ユーザー名のカンマ区切り）で指定する。"""
+    names = {n.strip() for n in os.environ.get("MANGA_ADMIN_USERS", "").split(",") if n.strip()}
+    return user.username in names
+
+
+def get_current_admin(current_user: User = Depends(get_current_user)) -> User:
+    if not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="管理者権限が必要です")
+    return current_user
+
+
+def _active_suspension(db: Session, author_id: int, title_id: int):
+    """有効な公開停止があればその行を返す。"""
+    return (
+        db.query(Suspension)
+        .filter(Suspension.author_id == author_id,
+                Suspension.title_id == title_id,
+                Suspension.lifted_at.is_(None))
+        .first()
+    )
+
+
+def _has_grant(db: Session, author_id: int, title_id: int, user_id: int) -> bool:
+    return (
+        db.query(Grant)
+        .filter(Grant.author_id == author_id,
+                Grant.title_id == title_id,
+                Grant.user_id == user_id)
+        .first()
+        is not None
+    )
+
+
+def _optional_reader(request: Request, db: Session):
+    """Authorization ヘッダがあれば検証してユーザーを返し、無ければ None。
+    ヘッダがあるのに無効なら 401（黙って匿名扱いに落とさない）。"""
+    auth = request.headers.get("Authorization", "")
+    if not auth:
+        return None
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="トークンが無効または期限切れです")
+    return user_from_token(auth[len("Bearer "):], db)
+
+
+def _enforce_not_suspended(db: Session, author_id: int, title_id: int) -> None:
+    if _active_suspension(db, author_id, title_id):
+        raise HTTPException(status_code=403, detail="この作品は公開が停止されています")
+
+
+def _enforce_premium_access(meta: dict, author_id: int, title_id: int,
+                            request: Request, db: Session) -> None:
+    """premium エピソードの配信前チェック（CBZ・サムネイル共通）。
+    public なら何もしない。拒否は HTTPException。"""
+    if meta.get("access_level") != "premium":
+        return
+    reader = _optional_reader(request, db)
+    if reader is None:
+        raise HTTPException(status_code=401, detail="この作品を読むにはログインが必要です")
+    if reader.id == author_id:
+        return
+    if not _has_grant(db, author_id, title_id, reader.id):
+        raise HTTPException(status_code=403, detail="この作品を読む許可がありません")
+    if meta.get("age_restricted") and reader.adult_declared_at is None:
+        raise HTTPException(status_code=403, detail="この作品を読むには年齢確認が必要です")
+
+
+def _enforce_age_access(meta: dict, author_id: int, request: Request, db: Session) -> None:
+    """年齢対象の無料作品の配信前チェック（CBZ・サムネイル共通）。
+
+    通れるのは：作者本人、年齢申告済みのログインユーザー、そして年齢ゲートを
+    通過した閲覧側からの取得（内部通信＋ X-Age-Verified ヘッダ）。
+    premium の年齢判定は _enforce_premium_access 側で行う。
+    """
+    if not meta.get("age_restricted") or meta.get("access_level") == "premium":
+        return
+    reader = _optional_reader(request, db)
+    if reader is not None and (reader.id == author_id or reader.adult_declared_at is not None):
+        return
+    if _is_internal_request(request) and request.headers.get("X-Age-Verified") == "1":
+        return
+    raise HTTPException(status_code=403, detail="年齢確認が必要です")
+
 # ---------------------------------------------------------------------------
 # Pydantic スキーマ
 # ---------------------------------------------------------------------------
@@ -171,6 +304,15 @@ class UserRegister(BaseModel):
     username: str
     email: EmailStr
     password: str
+    account_type: str = "author"   # author / reader（閲覧側の登録は reader）
+
+
+class GrantRequest(BaseModel):
+    username: str
+
+
+class AdminSuspendRequest(BaseModel):
+    reason: str = ""
 
 class EpisodePublishSettings(BaseModel):
     status:          str
@@ -183,6 +325,7 @@ class EpisodePublishSettings(BaseModel):
     scrambled:       bool = True
     tile_size:       int  = TILE_SIZE_DEFAULT
     webhook_enabled: bool = False
+    age_restricted:  bool = False
 
 # ---------------------------------------------------------------------------
 # ユーティリティ
@@ -399,12 +542,15 @@ async def signup(request: Request, user_data: UserRegister, db: Session = Depend
         raise HTTPException(400, "登録済みのメールアドレスです")
     if db.query(User).filter(User.username == user_data.username).first():
         raise HTTPException(400, "使用済みのユーザー名です")
+    if user_data.account_type not in ("author", "reader"):
+        raise HTTPException(400, "アカウント種別が不正です")
     if len(user_data.password) < 8:
         raise HTTPException(400, "パスワードは8文字以上で入力してください")
     if len(user_data.password.encode("utf-8")) > 72:
         raise HTTPException(400, "パスワードが長すぎます（72バイトまで）")
     hashed_pw = _hash_password(user_data.password)
-    db.add(User(username=user_data.username, email=user_data.email, hashed_password=hashed_pw))
+    db.add(User(username=user_data.username, email=user_data.email,
+                hashed_password=hashed_pw, account_type=user_data.account_type))
     db.commit()
     return {"message": "ユーザー登録が完了しました。ログインしてください。"}
 
@@ -426,16 +572,55 @@ async def login(
     )
     return {"access_token": access_token, "token_type": "bearer", "username": user.username}
 
+@app.get("/api/auth/me")
+async def auth_me(current_user: User = Depends(get_current_user)):
+    return {
+        "id":                current_user.id,
+        "username":          current_user.username,
+        "email":             current_user.email,
+        "account_type":      current_user.account_type or "author",
+        "is_admin":          is_admin(current_user),
+        "adult_declared_at": (current_user.adult_declared_at.isoformat()
+                              if current_user.adult_declared_at else None),
+    }
+
+
+@app.get("/api/auth/grants")
+async def my_grants(
+    current_user: User = Depends(get_current_user),
+    db:           Session = Depends(get_db),
+):
+    """自分に許可が出ている作品（author_id, title_id）の一覧。閲覧側の表示用。"""
+    rows = db.query(Grant).filter(Grant.user_id == current_user.id).all()
+    return [{"author_id": g.author_id, "title_id": g.title_id} for g in rows]
+
+
+@app.post("/api/auth/declare-adult")
+async def declare_adult(
+    current_user: User = Depends(get_current_user),
+    db:           Session = Depends(get_db),
+):
+    """年齢確認の自己申告を記録する（取り消しはできない）。"""
+    if current_user.adult_declared_at is None:
+        current_user.adult_declared_at = datetime.now(UTC)
+        db.commit()
+    return {"adult_declared_at": current_user.adult_declared_at.isoformat()}
+
+
 # ---------------------------------------------------------------------------
 # 作者：自分の作品一覧
 # ---------------------------------------------------------------------------
 
 @app.get("/api/author/works")
-async def get_my_works(current_user: User = Depends(get_current_user)):
+async def get_my_works(
+    current_user: User = Depends(get_current_author),
+    db:           Session = Depends(get_db),
+):
     works    = []
     user_dir = FINAL_ZIP_DIR / f"user_{current_user.id}"
     if not user_dir.exists():
         return []
+    susp_cache = {}
     for settings_path in sorted(user_dir.glob("title_*/episode_*_settings.json")):
         try:
             with open(settings_path, "r") as f:
@@ -444,6 +629,12 @@ async def get_my_works(current_user: User = Depends(get_current_user)):
             cover_path = settings_path.parent / f"episode_{meta['episode_id']}_cover.jpg"
             meta["has_cbz"]   = cbz_path.exists()
             meta["has_cover"] = cover_path.exists()
+            tid = meta.get("title_id")
+            if tid not in susp_cache:
+                susp_cache[tid] = _active_suspension(db, current_user.id, tid)
+            susp = susp_cache[tid]
+            meta["suspended"]      = susp is not None
+            meta["suspend_reason"] = susp.reason if susp else None
             works.append(meta)
         except Exception:
             continue
@@ -465,7 +656,7 @@ async def upload_manga(
     cover:            Optional[UploadFile] = File(default=None),
     do_scramble:      bool = True,
     tile_size:        int  = TILE_SIZE_DEFAULT,
-    current_user:     User = Depends(get_current_user),
+    current_user:     User = Depends(get_current_author),
 ):
     validate_tile_size(tile_size)
 
@@ -640,7 +831,7 @@ def _process_upload(
 @app.get("/api/author/upload-progress/{job_id}")
 async def get_upload_progress(
     job_id: str,
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_author)
 ):
     progress = upload_progress.get(job_id)
     if not progress:
@@ -661,7 +852,7 @@ async def update_settings(
     title_id:     int,
     episode_id:   int,
     settings:     EpisodePublishSettings,
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_author)
 ):
     validate_tile_size(settings.tile_size)
 
@@ -690,6 +881,7 @@ async def update_settings(
             "scrambled":       settings.scrambled,
             "tile_size":       settings.tile_size,
             "webhook_enabled": settings.webhook_enabled,
+            "age_restricted":  settings.age_restricted,
             "author_name":     current_user.username,
             "author_id":       current_user.id,
             "title_id":        title_id,
@@ -711,7 +903,7 @@ async def update_settings(
 async def delete_episode(
     title_id:     int,
     episode_id:   int,
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_author)
 ):
     user_dir      = FINAL_ZIP_DIR / f"user_{current_user.id}" / f"title_{title_id}"
     cbz_path      = user_dir / f"episode_{episode_id}.cbz"
@@ -747,7 +939,10 @@ async def preview_cbz(
     token:      str,
     db:         Session = Depends(get_db)
 ):
-    user_id = user_from_token(token, db).id
+    _token_user = user_from_token(token, db)
+    if _token_user.account_type == "reader":
+        raise HTTPException(status_code=403, detail="読者アカウントでは利用できません")
+    user_id = _token_user.id
 
     cbz_path = FINAL_ZIP_DIR / f"user_{user_id}" / f"title_{title_id}" / f"episode_{episode_id}.cbz"
     if not cbz_path.exists():
@@ -772,7 +967,10 @@ async def author_thumb(
     token:      str,
     db:         Session = Depends(get_db)
 ):
-    user_id = user_from_token(token, db).id
+    _token_user = user_from_token(token, db)
+    if _token_user.account_type == "reader":
+        raise HTTPException(status_code=403, detail="読者アカウントでは利用できません")
+    user_id = _token_user.id
 
     thumb_path = (
         FINAL_ZIP_DIR / f"user_{user_id}" / f"title_{title_id}"
@@ -795,7 +993,10 @@ async def author_cover(
     token:      str,
     db:         Session = Depends(get_db)
 ):
-    user_id = user_from_token(token, db).id
+    _token_user = user_from_token(token, db)
+    if _token_user.account_type == "reader":
+        raise HTTPException(status_code=403, detail="読者アカウントでは利用できません")
+    user_id = _token_user.id
 
     cover_path = (
         FINAL_ZIP_DIR / f"user_{user_id}" / f"title_{title_id}"
@@ -808,6 +1009,150 @@ async def author_cover(
                         headers={"Cache-Control": "max-age=86400"})
 
 # ---------------------------------------------------------------------------
+# 作者：閲覧許可（グラント）の管理
+# ---------------------------------------------------------------------------
+
+def _author_title_dir(current_user: User, title_id: int) -> Path:
+    title_dir = FINAL_ZIP_DIR / f"user_{current_user.id}" / f"title_{title_id}"
+    if not any(title_dir.glob("episode_*_settings.json")):
+        raise HTTPException(status_code=404, detail="作品が見つかりません")
+    return title_dir
+
+
+@app.get("/api/author/titles/{title_id}/grants")
+async def list_grants(
+    title_id:     int,
+    current_user: User = Depends(get_current_author),
+    db:           Session = Depends(get_db),
+):
+    _author_title_dir(current_user, title_id)
+    result = []
+    grants = (
+        db.query(Grant)
+        .filter(Grant.author_id == current_user.id, Grant.title_id == title_id)
+        .order_by(Grant.created_at)
+        .all()
+    )
+    for g in grants:
+        user = db.query(User).filter(User.id == g.user_id).first()
+        if user:
+            result.append({
+                "user_id":    user.id,
+                "username":   user.username,
+                "created_at": g.created_at.isoformat() if g.created_at else None,
+            })
+    return result
+
+
+@app.post("/api/author/titles/{title_id}/grants")
+async def create_grant(
+    title_id:     int,
+    body:         GrantRequest,
+    current_user: User = Depends(get_current_author),
+    db:           Session = Depends(get_db),
+):
+    _author_title_dir(current_user, title_id)
+    target = db.query(User).filter(User.username == body.username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="ユーザーが見つかりません")
+    if target.id == current_user.id:
+        raise HTTPException(status_code=400, detail="自分自身には許可できません")
+    existing = (
+        db.query(Grant)
+        .filter(Grant.author_id == current_user.id,
+                Grant.title_id == title_id,
+                Grant.user_id == target.id)
+        .first()
+    )
+    if existing:
+        return {"user_id": target.id, "username": target.username, "already": True}
+    db.add(Grant(author_id=current_user.id, title_id=title_id, user_id=target.id))
+    db.commit()
+    return {"user_id": target.id, "username": target.username, "already": False}
+
+
+@app.delete("/api/author/titles/{title_id}/grants/{user_id}")
+async def delete_grant(
+    title_id:     int,
+    user_id:      int,
+    current_user: User = Depends(get_current_author),
+    db:           Session = Depends(get_db),
+):
+    _author_title_dir(current_user, title_id)
+    grant = (
+        db.query(Grant)
+        .filter(Grant.author_id == current_user.id,
+                Grant.title_id == title_id,
+                Grant.user_id == user_id)
+        .first()
+    )
+    if not grant:
+        raise HTTPException(status_code=404, detail="許可が見つかりません")
+    db.delete(grant)
+    db.commit()
+    return {"status": "success"}
+
+
+# ---------------------------------------------------------------------------
+# 管理者：公開停止
+# ---------------------------------------------------------------------------
+
+@app.get("/api/admin/works")
+async def admin_works(
+    admin: User = Depends(get_current_admin),
+    db:    Session = Depends(get_db),
+):
+    works = []
+    for settings_path in sorted(FINAL_ZIP_DIR.glob("user_*/title_*/episode_*_settings.json")):
+        try:
+            with open(settings_path, "r") as f:
+                meta = json.load(f)
+            susp = _active_suspension(db, meta["author_id"], meta["title_id"])
+            meta["suspended"]      = susp is not None
+            meta["suspend_reason"] = susp.reason if susp else None
+            meta.pop("note", None)
+            works.append(meta)
+        except Exception:
+            continue
+    return works
+
+
+@app.post("/api/admin/titles/{author_id}/{title_id}/suspend")
+async def admin_suspend(
+    author_id: int,
+    title_id:  int,
+    body:      AdminSuspendRequest,
+    admin:     User = Depends(get_current_admin),
+    db:        Session = Depends(get_db),
+):
+    title_dir = FINAL_ZIP_DIR / f"user_{author_id}" / f"title_{title_id}"
+    if not any(title_dir.glob("episode_*_settings.json")):
+        raise HTTPException(status_code=404, detail="作品が見つかりません")
+    active = _active_suspension(db, author_id, title_id)
+    if active:
+        return {"status": "already_suspended", "reason": active.reason}
+    db.add(Suspension(author_id=author_id, title_id=title_id,
+                      reason=body.reason, suspended_by=admin.id))
+    db.commit()
+    return {"status": "suspended", "reason": body.reason}
+
+
+@app.post("/api/admin/titles/{author_id}/{title_id}/resume")
+async def admin_resume(
+    author_id: int,
+    title_id:  int,
+    admin:     User = Depends(get_current_admin),
+    db:        Session = Depends(get_db),
+):
+    active = _active_suspension(db, author_id, title_id)
+    if not active:
+        raise HTTPException(status_code=404, detail="公開停止されていません")
+    active.lifted_at = datetime.now(UTC)
+    db.commit()
+    return {"status": "resumed"}
+
+
+# ---------------------------------------------------------------------------
 # 公開：CBZ配信
 # ---------------------------------------------------------------------------
 
@@ -818,6 +1163,7 @@ async def serve_public_cbz(
     user_id:    int,
     title_id:   int,
     episode_id: int,
+    db:         Session = Depends(get_db),
 ):
     settings_path = (
         FINAL_ZIP_DIR / f"user_{user_id}" / f"title_{title_id}"
@@ -831,6 +1177,10 @@ async def serve_public_cbz(
 
     if meta.get("status") != "published":
         raise HTTPException(status_code=403, detail="この作品は非公開です")
+
+    _enforce_not_suspended(db, user_id, title_id)
+    _enforce_premium_access(meta, user_id, title_id, request, db)
+    _enforce_age_access(meta, user_id, request, db)
 
     cbz_path = FINAL_ZIP_DIR / f"user_{user_id}" / f"title_{title_id}" / f"episode_{episode_id}.cbz"
     if not cbz_path.exists():
@@ -852,7 +1202,8 @@ async def serve_public_cbz(
 # ---------------------------------------------------------------------------
 
 @app.get("/api/public/thumb/{user_id}/{title_id}/{episode_id}/{index}")
-async def public_thumb(user_id: int, title_id: int, episode_id: int, index: int):
+async def public_thumb(user_id: int, title_id: int, episode_id: int, index: int,
+                       request: Request, db: Session = Depends(get_db)):
     settings_path = (
         FINAL_ZIP_DIR / f"user_{user_id}" / f"title_{title_id}"
         / f"episode_{episode_id}_settings.json"
@@ -863,6 +1214,10 @@ async def public_thumb(user_id: int, title_id: int, episode_id: int, index: int)
         meta = json.load(f)
     if meta.get("status") != "published":
         raise HTTPException(status_code=403, detail="非公開です")
+
+    _enforce_not_suspended(db, user_id, title_id)
+    _enforce_premium_access(meta, user_id, title_id, request, db)
+    _enforce_age_access(meta, user_id, request, db)
 
     thumb_path = (
         FINAL_ZIP_DIR / f"user_{user_id}" / f"title_{title_id}"
@@ -880,7 +1235,7 @@ async def public_thumb(user_id: int, title_id: int, episode_id: int, index: int)
 
 @app.get("/api/public/catalog")
 @limiter.limit("5/minute", exempt_when=_is_internal_request)
-async def public_catalog(request: Request):
+async def public_catalog(request: Request, db: Session = Depends(get_db)):
     base_url       = str(request.base_url).rstrip("/")
     published_list = []
     for settings_path in FINAL_ZIP_DIR.glob("user_*/title_*/episode_*_settings.json"):
@@ -892,12 +1247,14 @@ async def public_catalog(request: Request):
             uid = meta["author_id"]
             tid = meta["title_id"]
             eid = meta["episode_id"]
+            if _active_suspension(db, uid, tid):
+                continue
             meta["cbz_url"]   = f"{base_url}/api/public/cbz/{uid}/{tid}/{eid}.cbz"
             # カバー画像URL
             cover_path = settings_path.parent / f"episode_{eid}_cover.jpg"
             meta["cover_url"] = (
                 f"{base_url}/api/public/cover/{uid}/{tid}/{eid}"
-                if cover_path.exists() else None
+                if cover_path.exists() and not meta.get("age_restricted") else None
             )
             # noteは公開APIから除外
             meta.pop("note", None)
@@ -911,7 +1268,8 @@ async def public_catalog(request: Request):
 # ---------------------------------------------------------------------------
 
 @app.get("/api/public/cover/{user_id}/{title_id}/{episode_id}")
-async def public_cover(user_id: int, title_id: int, episode_id: int):
+async def public_cover(user_id: int, title_id: int, episode_id: int,
+                       db: Session = Depends(get_db)):
     settings_path = (
         FINAL_ZIP_DIR / f"user_{user_id}" / f"title_{title_id}"
         / f"episode_{episode_id}_settings.json"
@@ -922,6 +1280,10 @@ async def public_cover(user_id: int, title_id: int, episode_id: int):
         meta = json.load(f)
     if meta.get("status") != "published":
         raise HTTPException(status_code=403, detail="非公開です")
+
+    _enforce_not_suspended(db, user_id, title_id)
+    if meta.get("age_restricted"):
+        raise HTTPException(status_code=403, detail="年齢確認が必要な作品の表紙は表示できません")
 
     cover_path = (
         FINAL_ZIP_DIR / f"user_{user_id}" / f"title_{title_id}"
@@ -1038,6 +1400,7 @@ index_html_content = r'''<!DOCTYPE html>
   <a onclick="requireLogin('works-page'); loadMyWorks();">📋 マイ作品</a>
   <a onclick="showPage('upload-page')">📤 アップロード</a>
   <a onclick="showPage('auth-page')">🔐 アカウント</a>
+  <a id="admin-nav" style="display:none" onclick="requireLogin('admin-page'); loadAdminWorks();">🛡 管理</a>
   <span id="login-status">未ログイン</span>
 </nav>
 
@@ -1060,6 +1423,13 @@ index_html_content = r'''<!DOCTYPE html>
   <h2>📋 マイ作品管理</h2>
   <button class="btn btn-ghost" onclick="loadMyWorks()" style="margin-bottom:16px">🔄 更新</button>
   <div id="works-list"><div class="empty-state">読み込み中…</div></div>
+</div>
+
+<!-- 管理者：全作品と公開停止 -->
+<div id="admin-page" class="container page">
+  <h2>🛡 管理者：全作品</h2>
+  <button class="btn btn-ghost" onclick="loadAdminWorks()" style="margin-bottom:16px">🔄 更新</button>
+  <div id="admin-works-list"><div class="empty-state">読み込み中…</div></div>
 </div>
 
 <!-- アップロード -->
@@ -1135,6 +1505,13 @@ index_html_content = r'''<!DOCTYPE html>
         <option value="32">32px（軽量）</option>
       </select>
     </div>
+  </div>
+
+  <div class="form-group">
+    <label>
+      <input type="checkbox" id="age_restricted" style="width:auto;margin-right:6px">
+      年齢確認が必要な作品にする（18歳未満は閲覧できません）
+    </label>
   </div>
 
   <!-- Webhook設定 -->
@@ -1229,6 +1606,9 @@ index_html_content = r'''<!DOCTYPE html>
     <div class="form-group">
       <label><input type="checkbox" id="edit-webhook" style="width:auto;margin-right:6px">Discord Webhook送信を許可する</label>
     </div>
+    <div class="form-group">
+      <label><input type="checkbox" id="edit-age-restricted" style="width:auto;margin-right:6px">年齢確認が必要な作品にする</label>
+    </div>
     <div id="edit-msg" style="margin-top:8px"></div>
     <div class="modal-footer">
       <button class="btn btn-ghost" onclick="closeEditModal()">キャンセル</button>
@@ -1248,6 +1628,24 @@ index_html_content = r'''<!DOCTYPE html>
     <div class="modal-footer">
       <button class="btn btn-ghost" onclick="closeDeleteModal()">キャンセル</button>
       <button class="btn btn-danger" onclick="confirmDelete()">削除する</button>
+    </div>
+  </div>
+</div>
+
+<!-- 閲覧許可モーダル -->
+<div id="grants-modal" class="modal-overlay">
+  <div class="modal">
+    <h3>🔑 閲覧許可</h3>
+    <p id="grants-target-name" style="font-weight:700;margin:12px 0;color:#1e293b"></p>
+    <input type="hidden" id="grants-title-id">
+    <div id="grants-list" style="margin-bottom:12px"></div>
+    <div style="display:flex;gap:8px">
+      <input type="text" id="grants-username" placeholder="許可するユーザー名" style="flex:1">
+      <button class="btn btn-primary" onclick="addGrant()">追加</button>
+    </div>
+    <div id="grants-msg" style="margin-top:8px"></div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeGrantsModal()">閉じる</button>
     </div>
   </div>
 </div>
@@ -1312,6 +1710,7 @@ async function handleLogin() {
     if (!res.ok) throw new Error(data.detail || "ログイン失敗");
     token = data.access_token;
     document.getElementById("login-status").textContent = `👤 ${data.username}`;
+    refreshMe();
     document.getElementById("upload-warn").style.display = "none";
     showMsg('login-msg','success', `${data.username} としてログインしました`);
     showPage('works-page');
@@ -1402,10 +1801,12 @@ async function loadMyWorks() {
                 <span class="badge ${isPublished?'badge-published':'badge-draft'}">${isPublished?'公開中':'下書き'}</span>
                 &nbsp;
                 <span class="badge ${w.access_level==='public'?'badge-free':'badge-premium'}">${w.access_level==='public'?'無料':'許可制'}</span>
+                ${w.age_restricted ? ' &nbsp;<span style="font-size:.72rem;color:#dc2626">🔞 年齢確認</span>' : ''}
                 ${w.scrambled ? ' &nbsp;<span style="font-size:.72rem;color:#7c3aed">🔒 スクランブル済</span>' : ''}
                 ${!w.has_cbz  ? ' &nbsp;<span style="color:#ef4444;font-size:.75rem">⚠ CBZ未生成</span>' : ''}
                 ${isPublished ? ` &nbsp;<span style="font-size:.78rem;color:#64748b">👁 ${(w.view_count||0).toLocaleString()} views</span>` : ''}
               </div>
+              ${w.suspended ? `<div style="color:#dc2626;font-weight:700;font-size:.82rem;margin-top:4px">⛔ 管理者により公開停止中${w.suspend_reason ? `（理由：${esc(w.suspend_reason)}）` : ''}</div>` : ''}
               ${w.caption ? `<div class="work-card-caption">${esc(w.caption)}</div>` : ''}
               ${w.note    ? `<div class="work-card-note">📝 ${esc(w.note)}</div>` : ''}
             </div>
@@ -1413,6 +1814,7 @@ async function loadMyWorks() {
           <div class="work-card-actions">
             <button class="btn btn-ghost" onclick='openEditModal(${w.title_id},${w.episode_id},${JSON.stringify(w)})'>✏️ 編集</button>
             ${canPreview ? `<button class="btn btn-ghost" onclick="openPreview('${previewUrl}')">👁 プレビュー</button>` : ''}
+            <button class="btn btn-ghost" onclick="openGrantsModal(${w.title_id},'${titleLabel}')">🔑 閲覧許可</button>
             <button class="btn btn-danger" style="margin-left:auto" onclick="openDeleteModal(${w.title_id},${w.episode_id},'${titleLabel} — ${episodeLabel}')">🗑 削除</button>
           </div>
         </div>`;
@@ -1442,6 +1844,7 @@ function openEditModal(titleId, episodeId, w) {
   document.getElementById('edit-status').value       = w.status;
   document.getElementById('edit-access').value       = w.access_level;
   document.getElementById('edit-webhook').checked    = !!w.webhook_enabled;
+  document.getElementById('edit-age-restricted').checked = !!w.age_restricted;
   editScrambled = w.scrambled !== false;
   editTileSize  = w.tile_size || 16;
   document.getElementById('edit-msg').textContent    = '';
@@ -1461,6 +1864,7 @@ async function saveEdit() {
     status:          document.getElementById('edit-status').value,
     access_level:    document.getElementById('edit-access').value,
     webhook_enabled: document.getElementById('edit-webhook').checked,
+    age_restricted:  document.getElementById('edit-age-restricted').checked,
     scrambled: editScrambled, tile_size: editTileSize, // 編集では既存値を維持（変更不可）
   };
   try {
@@ -1611,6 +2015,7 @@ async function startUpload() {
         comment:         document.getElementById('comment').value,
         note:            document.getElementById('note').value,
         webhook_enabled: document.getElementById('webhook_enabled').checked,
+        age_restricted:  document.getElementById('age_restricted').checked,
         scrambled:       scramble === '1',
         tile_size:       parseInt(tileSize),
       })
@@ -1628,6 +2033,138 @@ async function startUpload() {
   } finally {
     document.getElementById('upload-btn').disabled = selectedFiles.length === 0;
   }
+}
+
+/* ── 自分の情報（管理者ナビの表示判定） ── */
+async function refreshMe() {
+  if (!token) return;
+  try {
+    const res = await fetch("/api/auth/me", { headers: {"Authorization":`Bearer ${token}`} });
+    if (!res.ok) return;
+    const me = await res.json();
+    document.getElementById('admin-nav').style.display = me.is_admin ? '' : 'none';
+  } catch(e) {}
+}
+
+/* ── 閲覧許可モーダル ── */
+function openGrantsModal(titleId, titleLabel) {
+  document.getElementById('grants-title-id').value = titleId;
+  document.getElementById('grants-target-name').textContent = titleLabel;
+  document.getElementById('grants-username').value = '';
+  document.getElementById('grants-msg').textContent = '';
+  document.getElementById('grants-modal').classList.add('open');
+  loadGrants();
+}
+function closeGrantsModal() { document.getElementById('grants-modal').classList.remove('open'); }
+
+async function loadGrants() {
+  const titleId = document.getElementById('grants-title-id').value;
+  const el = document.getElementById('grants-list');
+  el.innerHTML = '<div style="font-size:.85rem;color:#64748b">読み込み中…</div>';
+  try {
+    const res  = await fetch(`/api/author/titles/${titleId}/grants`, { headers: {"Authorization":`Bearer ${token}`} });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || '取得失敗');
+    if (!data.length) { el.innerHTML = '<div style="font-size:.85rem;color:#64748b">許可しているユーザーはいません</div>'; return; }
+    el.innerHTML = data.map(g => `
+      <div style="display:flex;align-items:center;gap:8px;padding:4px 0">
+        <span style="flex:1">👤 ${esc(g.username)}</span>
+        <button class="btn btn-danger" onclick="removeGrant(${g.user_id})">取り消し</button>
+      </div>`).join('');
+  } catch(e) { el.innerHTML = `<div style="font-size:.85rem;color:#dc2626">${esc(e.message)}</div>`; }
+}
+
+async function addGrant() {
+  const titleId  = document.getElementById('grants-title-id').value;
+  const username = document.getElementById('grants-username').value.trim();
+  if (!username) return;
+  try {
+    const res  = await fetch(`/api/author/titles/${titleId}/grants`, {
+      method:'POST', headers:{'Content-Type':'application/json','Authorization':`Bearer ${token}`},
+      body: JSON.stringify({username})
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || '追加失敗');
+    showMsg('grants-msg','success', data.already ? 'すでに許可済みです' : '許可を追加しました');
+    document.getElementById('grants-username').value = '';
+    loadGrants();
+  } catch(e) { showMsg('grants-msg','error', e.message); }
+}
+
+async function removeGrant(userId) {
+  const titleId = document.getElementById('grants-title-id').value;
+  try {
+    const res  = await fetch(`/api/author/titles/${titleId}/grants/${userId}`, {
+      method:'DELETE', headers:{"Authorization":`Bearer ${token}`}
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || '取り消し失敗');
+    loadGrants();
+  } catch(e) { showMsg('grants-msg','error', e.message); }
+}
+
+/* ── 管理者：全作品と公開停止 ── */
+async function loadAdminWorks() {
+  if (!token) return;
+  const el = document.getElementById('admin-works-list');
+  el.innerHTML = '<div class="empty-state">読み込み中…</div>';
+  try {
+    const res   = await fetch('/api/admin/works', { headers: {"Authorization":`Bearer ${token}`} });
+    const works = await res.json();
+    if (!res.ok) throw new Error(works.detail || '取得失敗');
+    if (!works.length) { el.innerHTML = '<div class="empty-state">作品がありません</div>'; return; }
+    const groups = new Map();
+    for (const w of works) {
+      const key = `${w.author_id}/${w.title_id}`;
+      if (!groups.has(key)) groups.set(key, {
+        author_id: w.author_id, title_id: w.title_id,
+        author_name: w.author_name || '', title_name: w.title_name || `作品${w.title_id}`,
+        suspended: !!w.suspended, suspend_reason: w.suspend_reason || '', episodes: [],
+      });
+      groups.get(key).episodes.push(w);
+    }
+    el.innerHTML = [...groups.values()].map(g => {
+      const eps = g.episodes.map(w =>
+        `${esc(w.episode_name || `エピソード${w.episode_id}`)}（${w.status==='published'?'公開中':'下書き'}・${w.access_level==='public'?'無料':'許可制'}）`
+      ).join('、');
+      const controls = g.suspended
+        ? `<span style="color:#dc2626;font-weight:700">⛔ 公開停止中</span>
+           <button class="btn btn-primary" onclick="adminResume(${g.author_id},${g.title_id})">解除する</button>`
+        : `<input type="text" id="suspend-reason-${g.author_id}-${g.title_id}" placeholder="停止の理由（任意）" style="flex:1;min-width:160px">
+           <button class="btn btn-danger" onclick="adminSuspend(${g.author_id},${g.title_id})">公開を停止</button>`;
+      return `
+        <div class="work-card">
+          <div class="work-card-title">${esc(g.title_name)} <span style="font-weight:400;color:#64748b;font-size:.8rem">👤 ${esc(g.author_name)}</span></div>
+          <div class="work-card-sub" style="margin:6px 0">${eps}</div>
+          ${g.suspended && g.suspend_reason ? `<div style="font-size:.8rem;color:#475569">理由：${esc(g.suspend_reason)}</div>` : ''}
+          <div class="work-card-actions">${controls}</div>
+        </div>`;
+    }).join('');
+  } catch(e) { el.innerHTML = `<div class="empty-state">エラー: ${esc(e.message)}</div>`; }
+}
+
+async function adminSuspend(authorId, titleId) {
+  const reason = document.getElementById(`suspend-reason-${authorId}-${titleId}`).value;
+  try {
+    const res  = await fetch(`/api/admin/titles/${authorId}/${titleId}/suspend`, {
+      method:'POST', headers:{'Content-Type':'application/json','Authorization':`Bearer ${token}`},
+      body: JSON.stringify({reason})
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || '停止失敗');
+    loadAdminWorks();
+  } catch(e) { alert(e.message); }
+}
+
+async function adminResume(authorId, titleId) {
+  try {
+    const res  = await fetch(`/api/admin/titles/${authorId}/${titleId}/resume`, {
+      method:'POST', headers:{"Authorization":`Bearer ${token}`}
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || '解除失敗');
+    loadAdminWorks();
+  } catch(e) { alert(e.message); }
 }
 
 /* ── ユーティリティ ── */

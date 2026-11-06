@@ -1,0 +1,2565 @@
+diff a/main.py b/main.py
+--- a/main.py	2026-11-06 22:31:26.140108681 +0900
++++ b/main.py	2026-11-06 22:31:26.195698430 +0900
+@@ -23,7 +23,7 @@
+ import bcrypt
+ from jose import jwt, JWTError
+ from PIL import Image
+-from sqlalchemy import create_engine, Column, Integer, String, Boolean
++from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, UniqueConstraint
+ from sqlalchemy.orm import sessionmaker, declarative_base, Session
+ from slowapi import Limiter
+ from slowapi.util import get_remote_address
+@@ -113,9 +113,51 @@
+     email           = Column(String,  unique=True, index=True, nullable=False)
+     hashed_password = Column(String,  nullable=False)
+     is_active       = Column(Boolean, default=True)
++    # author=作家用 / reader=読むためだけのアカウント（アップロード不可）
++    account_type    = Column(String,  default="author")
++    # 年齢確認の自己申告をした日時（NULL=未申告）
++    adult_declared_at = Column(DateTime, nullable=True)
++
++class Grant(Base):
++    """作家が読者へ出す作品（title）単位の閲覧許可。"""
++    __tablename__ = "grants"
++    id         = Column(Integer, primary_key=True, index=True)
++    author_id  = Column(Integer, index=True, nullable=False)
++    title_id   = Column(Integer, index=True, nullable=False)
++    user_id    = Column(Integer, index=True, nullable=False)
++    created_at = Column(DateTime, default=lambda: datetime.now(UTC))
++    __table_args__ = (UniqueConstraint("author_id", "title_id", "user_id"),)
++
++class Suspension(Base):
++    """管理者による作品（title）単位の公開停止。lifted_at が NULL の行が有効。"""
++    __tablename__ = "suspensions"
++    id           = Column(Integer, primary_key=True, index=True)
++    author_id    = Column(Integer, index=True, nullable=False)
++    title_id     = Column(Integer, index=True, nullable=False)
++    reason       = Column(String,  default="")
++    suspended_by = Column(Integer, nullable=False)
++    created_at   = Column(DateTime, default=lambda: datetime.now(UTC))
++    lifted_at    = Column(DateTime, nullable=True)
+ 
+ Base.metadata.create_all(bind=engine)
+ 
++
++def _migrate_users_columns() -> None:
++    """既存 DB の users テーブルに後付けの列が無ければ足す（create_all は
++    既存テーブルを変更しないため）。新規 DB では何もしない。"""
++    from sqlalchemy import inspect, text
++    cols = {c["name"] for c in inspect(engine).get_columns("users")}
++    with engine.begin() as conn:
++        if "account_type" not in cols:
++            conn.execute(text(
++                "ALTER TABLE users ADD COLUMN account_type VARCHAR DEFAULT 'author'"))
++        if "adult_declared_at" not in cols:
++            conn.execute(text(
++                "ALTER TABLE users ADD COLUMN adult_declared_at DATETIME"))
++
++
++_migrate_users_columns()
++
+ def get_db() -> Generator[Session, None, None]:
+     db = SessionLocal()
+     try:
+@@ -164,6 +206,97 @@
+ ) -> User:
+     return user_from_token(token, db)
+ 
++
++def get_current_author(current_user: User = Depends(get_current_user)) -> User:
++    """作者系エンドポイント用。reader アカウントは使えない。"""
++    if current_user.account_type == "reader":
++        raise HTTPException(status_code=403, detail="読者アカウントでは利用できません")
++    return current_user
++
++
++def is_admin(user: User) -> bool:
++    """管理者は環境変数 MANGA_ADMIN_USERS（ユーザー名のカンマ区切り）で指定する。"""
++    names = {n.strip() for n in os.environ.get("MANGA_ADMIN_USERS", "").split(",") if n.strip()}
++    return user.username in names
++
++
++def get_current_admin(current_user: User = Depends(get_current_user)) -> User:
++    if not is_admin(current_user):
++        raise HTTPException(status_code=403, detail="管理者権限が必要です")
++    return current_user
++
++
++def _active_suspension(db: Session, author_id: int, title_id: int):
++    """有効な公開停止があればその行を返す。"""
++    return (
++        db.query(Suspension)
++        .filter(Suspension.author_id == author_id,
++                Suspension.title_id == title_id,
++                Suspension.lifted_at.is_(None))
++        .first()
++    )
++
++
++def _has_grant(db: Session, author_id: int, title_id: int, user_id: int) -> bool:
++    return (
++        db.query(Grant)
++        .filter(Grant.author_id == author_id,
++                Grant.title_id == title_id,
++                Grant.user_id == user_id)
++        .first()
++        is not None
++    )
++
++
++def _optional_reader(request: Request, db: Session):
++    """Authorization ヘッダがあれば検証してユーザーを返し、無ければ None。
++    ヘッダがあるのに無効なら 401（黙って匿名扱いに落とさない）。"""
++    auth = request.headers.get("Authorization", "")
++    if not auth:
++        return None
++    if not auth.startswith("Bearer "):
++        raise HTTPException(status_code=401, detail="トークンが無効または期限切れです")
++    return user_from_token(auth[len("Bearer "):], db)
++
++
++def _enforce_not_suspended(db: Session, author_id: int, title_id: int) -> None:
++    if _active_suspension(db, author_id, title_id):
++        raise HTTPException(status_code=403, detail="この作品は公開が停止されています")
++
++
++def _enforce_premium_access(meta: dict, author_id: int, title_id: int,
++                            request: Request, db: Session) -> None:
++    """premium エピソードの配信前チェック（CBZ・サムネイル共通）。
++    public なら何もしない。拒否は HTTPException。"""
++    if meta.get("access_level") != "premium":
++        return
++    reader = _optional_reader(request, db)
++    if reader is None:
++        raise HTTPException(status_code=401, detail="この作品を読むにはログインが必要です")
++    if reader.id == author_id:
++        return
++    if not _has_grant(db, author_id, title_id, reader.id):
++        raise HTTPException(status_code=403, detail="この作品を読む許可がありません")
++    if meta.get("age_restricted") and reader.adult_declared_at is None:
++        raise HTTPException(status_code=403, detail="この作品を読むには年齢確認が必要です")
++
++
++def _enforce_age_access(meta: dict, author_id: int, request: Request, db: Session) -> None:
++    """年齢対象の無料作品の配信前チェック（CBZ・サムネイル共通）。
++
++    通れるのは：作者本人、年齢申告済みのログインユーザー、そして年齢ゲートを
++    通過した閲覧側からの取得（内部通信＋ X-Age-Verified ヘッダ）。
++    premium の年齢判定は _enforce_premium_access 側で行う。
++    """
++    if not meta.get("age_restricted") or meta.get("access_level") == "premium":
++        return
++    reader = _optional_reader(request, db)
++    if reader is not None and (reader.id == author_id or reader.adult_declared_at is not None):
++        return
++    if _is_internal_request(request) and request.headers.get("X-Age-Verified") == "1":
++        return
++    raise HTTPException(status_code=403, detail="年齢確認が必要です")
++
+ # ---------------------------------------------------------------------------
+ # Pydantic スキーマ
+ # ---------------------------------------------------------------------------
+@@ -171,6 +304,15 @@
+     username: str
+     email: EmailStr
+     password: str
++    account_type: str = "author"   # author / reader（閲覧側の登録は reader）
++
++
++class GrantRequest(BaseModel):
++    username: str
++
++
++class AdminSuspendRequest(BaseModel):
++    reason: str = ""
+ 
+ class EpisodePublishSettings(BaseModel):
+     status:          str
+@@ -183,6 +325,7 @@
+     scrambled:       bool = True
+     tile_size:       int  = TILE_SIZE_DEFAULT
+     webhook_enabled: bool = False
++    age_restricted:  bool = False
+ 
+ # ---------------------------------------------------------------------------
+ # ユーティリティ
+@@ -399,12 +542,15 @@
+         raise HTTPException(400, "登録済みのメールアドレスです")
+     if db.query(User).filter(User.username == user_data.username).first():
+         raise HTTPException(400, "使用済みのユーザー名です")
++    if user_data.account_type not in ("author", "reader"):
++        raise HTTPException(400, "アカウント種別が不正です")
+     if len(user_data.password) < 8:
+         raise HTTPException(400, "パスワードは8文字以上で入力してください")
+     if len(user_data.password.encode("utf-8")) > 72:
+         raise HTTPException(400, "パスワードが長すぎます（72バイトまで）")
+     hashed_pw = _hash_password(user_data.password)
+-    db.add(User(username=user_data.username, email=user_data.email, hashed_password=hashed_pw))
++    db.add(User(username=user_data.username, email=user_data.email,
++                hashed_password=hashed_pw, account_type=user_data.account_type))
+     db.commit()
+     return {"message": "ユーザー登録が完了しました。ログインしてください。"}
+ 
+@@ -426,16 +572,55 @@
+     )
+     return {"access_token": access_token, "token_type": "bearer", "username": user.username}
+ 
++@app.get("/api/auth/me")
++async def auth_me(current_user: User = Depends(get_current_user)):
++    return {
++        "id":                current_user.id,
++        "username":          current_user.username,
++        "email":             current_user.email,
++        "account_type":      current_user.account_type or "author",
++        "is_admin":          is_admin(current_user),
++        "adult_declared_at": (current_user.adult_declared_at.isoformat()
++                              if current_user.adult_declared_at else None),
++    }
++
++
++@app.get("/api/auth/grants")
++async def my_grants(
++    current_user: User = Depends(get_current_user),
++    db:           Session = Depends(get_db),
++):
++    """自分に許可が出ている作品（author_id, title_id）の一覧。閲覧側の表示用。"""
++    rows = db.query(Grant).filter(Grant.user_id == current_user.id).all()
++    return [{"author_id": g.author_id, "title_id": g.title_id} for g in rows]
++
++
++@app.post("/api/auth/declare-adult")
++async def declare_adult(
++    current_user: User = Depends(get_current_user),
++    db:           Session = Depends(get_db),
++):
++    """年齢確認の自己申告を記録する（取り消しはできない）。"""
++    if current_user.adult_declared_at is None:
++        current_user.adult_declared_at = datetime.now(UTC)
++        db.commit()
++    return {"adult_declared_at": current_user.adult_declared_at.isoformat()}
++
++
+ # ---------------------------------------------------------------------------
+ # 作者：自分の作品一覧
+ # ---------------------------------------------------------------------------
+ 
+ @app.get("/api/author/works")
+-async def get_my_works(current_user: User = Depends(get_current_user)):
++async def get_my_works(
++    current_user: User = Depends(get_current_author),
++    db:           Session = Depends(get_db),
++):
+     works    = []
+     user_dir = FINAL_ZIP_DIR / f"user_{current_user.id}"
+     if not user_dir.exists():
+         return []
++    susp_cache = {}
+     for settings_path in sorted(user_dir.glob("title_*/episode_*_settings.json")):
+         try:
+             with open(settings_path, "r") as f:
+@@ -444,6 +629,12 @@
+             cover_path = settings_path.parent / f"episode_{meta['episode_id']}_cover.jpg"
+             meta["has_cbz"]   = cbz_path.exists()
+             meta["has_cover"] = cover_path.exists()
++            tid = meta.get("title_id")
++            if tid not in susp_cache:
++                susp_cache[tid] = _active_suspension(db, current_user.id, tid)
++            susp = susp_cache[tid]
++            meta["suspended"]      = susp is not None
++            meta["suspend_reason"] = susp.reason if susp else None
+             works.append(meta)
+         except Exception:
+             continue
+@@ -465,7 +656,7 @@
+     cover:            Optional[UploadFile] = File(default=None),
+     do_scramble:      bool = True,
+     tile_size:        int  = TILE_SIZE_DEFAULT,
+-    current_user:     User = Depends(get_current_user),
++    current_user:     User = Depends(get_current_author),
+ ):
+     validate_tile_size(tile_size)
+ 
+@@ -640,7 +831,7 @@
+ @app.get("/api/author/upload-progress/{job_id}")
+ async def get_upload_progress(
+     job_id: str,
+-    current_user: User = Depends(get_current_user)
++    current_user: User = Depends(get_current_author)
+ ):
+     progress = upload_progress.get(job_id)
+     if not progress:
+@@ -661,7 +852,7 @@
+     title_id:     int,
+     episode_id:   int,
+     settings:     EpisodePublishSettings,
+-    current_user: User = Depends(get_current_user)
++    current_user: User = Depends(get_current_author)
+ ):
+     validate_tile_size(settings.tile_size)
+ 
+@@ -690,6 +881,7 @@
+             "scrambled":       settings.scrambled,
+             "tile_size":       settings.tile_size,
+             "webhook_enabled": settings.webhook_enabled,
++            "age_restricted":  settings.age_restricted,
+             "author_name":     current_user.username,
+             "author_id":       current_user.id,
+             "title_id":        title_id,
+@@ -711,7 +903,7 @@
+ async def delete_episode(
+     title_id:     int,
+     episode_id:   int,
+-    current_user: User = Depends(get_current_user)
++    current_user: User = Depends(get_current_author)
+ ):
+     user_dir      = FINAL_ZIP_DIR / f"user_{current_user.id}" / f"title_{title_id}"
+     cbz_path      = user_dir / f"episode_{episode_id}.cbz"
+@@ -747,7 +939,10 @@
+     token:      str,
+     db:         Session = Depends(get_db)
+ ):
+-    user_id = user_from_token(token, db).id
++    _token_user = user_from_token(token, db)
++    if _token_user.account_type == "reader":
++        raise HTTPException(status_code=403, detail="読者アカウントでは利用できません")
++    user_id = _token_user.id
+ 
+     cbz_path = FINAL_ZIP_DIR / f"user_{user_id}" / f"title_{title_id}" / f"episode_{episode_id}.cbz"
+     if not cbz_path.exists():
+@@ -772,7 +967,10 @@
+     token:      str,
+     db:         Session = Depends(get_db)
+ ):
+-    user_id = user_from_token(token, db).id
++    _token_user = user_from_token(token, db)
++    if _token_user.account_type == "reader":
++        raise HTTPException(status_code=403, detail="読者アカウントでは利用できません")
++    user_id = _token_user.id
+ 
+     thumb_path = (
+         FINAL_ZIP_DIR / f"user_{user_id}" / f"title_{title_id}"
+@@ -795,7 +993,10 @@
+     token:      str,
+     db:         Session = Depends(get_db)
+ ):
+-    user_id = user_from_token(token, db).id
++    _token_user = user_from_token(token, db)
++    if _token_user.account_type == "reader":
++        raise HTTPException(status_code=403, detail="読者アカウントでは利用できません")
++    user_id = _token_user.id
+ 
+     cover_path = (
+         FINAL_ZIP_DIR / f"user_{user_id}" / f"title_{title_id}"
+@@ -808,6 +1009,150 @@
+                         headers={"Cache-Control": "max-age=86400"})
+ 
+ # ---------------------------------------------------------------------------
++# 作者：閲覧許可（グラント）の管理
++# ---------------------------------------------------------------------------
++
++def _author_title_dir(current_user: User, title_id: int) -> Path:
++    title_dir = FINAL_ZIP_DIR / f"user_{current_user.id}" / f"title_{title_id}"
++    if not any(title_dir.glob("episode_*_settings.json")):
++        raise HTTPException(status_code=404, detail="作品が見つかりません")
++    return title_dir
++
++
++@app.get("/api/author/titles/{title_id}/grants")
++async def list_grants(
++    title_id:     int,
++    current_user: User = Depends(get_current_author),
++    db:           Session = Depends(get_db),
++):
++    _author_title_dir(current_user, title_id)
++    result = []
++    grants = (
++        db.query(Grant)
++        .filter(Grant.author_id == current_user.id, Grant.title_id == title_id)
++        .order_by(Grant.created_at)
++        .all()
++    )
++    for g in grants:
++        user = db.query(User).filter(User.id == g.user_id).first()
++        if user:
++            result.append({
++                "user_id":    user.id,
++                "username":   user.username,
++                "created_at": g.created_at.isoformat() if g.created_at else None,
++            })
++    return result
++
++
++@app.post("/api/author/titles/{title_id}/grants")
++async def create_grant(
++    title_id:     int,
++    body:         GrantRequest,
++    current_user: User = Depends(get_current_author),
++    db:           Session = Depends(get_db),
++):
++    _author_title_dir(current_user, title_id)
++    target = db.query(User).filter(User.username == body.username).first()
++    if not target:
++        raise HTTPException(status_code=404, detail="ユーザーが見つかりません")
++    if target.id == current_user.id:
++        raise HTTPException(status_code=400, detail="自分自身には許可できません")
++    existing = (
++        db.query(Grant)
++        .filter(Grant.author_id == current_user.id,
++                Grant.title_id == title_id,
++                Grant.user_id == target.id)
++        .first()
++    )
++    if existing:
++        return {"user_id": target.id, "username": target.username, "already": True}
++    db.add(Grant(author_id=current_user.id, title_id=title_id, user_id=target.id))
++    db.commit()
++    return {"user_id": target.id, "username": target.username, "already": False}
++
++
++@app.delete("/api/author/titles/{title_id}/grants/{user_id}")
++async def delete_grant(
++    title_id:     int,
++    user_id:      int,
++    current_user: User = Depends(get_current_author),
++    db:           Session = Depends(get_db),
++):
++    _author_title_dir(current_user, title_id)
++    grant = (
++        db.query(Grant)
++        .filter(Grant.author_id == current_user.id,
++                Grant.title_id == title_id,
++                Grant.user_id == user_id)
++        .first()
++    )
++    if not grant:
++        raise HTTPException(status_code=404, detail="許可が見つかりません")
++    db.delete(grant)
++    db.commit()
++    return {"status": "success"}
++
++
++# ---------------------------------------------------------------------------
++# 管理者：公開停止
++# ---------------------------------------------------------------------------
++
++@app.get("/api/admin/works")
++async def admin_works(
++    admin: User = Depends(get_current_admin),
++    db:    Session = Depends(get_db),
++):
++    works = []
++    for settings_path in sorted(FINAL_ZIP_DIR.glob("user_*/title_*/episode_*_settings.json")):
++        try:
++            with open(settings_path, "r") as f:
++                meta = json.load(f)
++            susp = _active_suspension(db, meta["author_id"], meta["title_id"])
++            meta["suspended"]      = susp is not None
++            meta["suspend_reason"] = susp.reason if susp else None
++            meta.pop("note", None)
++            works.append(meta)
++        except Exception:
++            continue
++    return works
++
++
++@app.post("/api/admin/titles/{author_id}/{title_id}/suspend")
++async def admin_suspend(
++    author_id: int,
++    title_id:  int,
++    body:      AdminSuspendRequest,
++    admin:     User = Depends(get_current_admin),
++    db:        Session = Depends(get_db),
++):
++    title_dir = FINAL_ZIP_DIR / f"user_{author_id}" / f"title_{title_id}"
++    if not any(title_dir.glob("episode_*_settings.json")):
++        raise HTTPException(status_code=404, detail="作品が見つかりません")
++    active = _active_suspension(db, author_id, title_id)
++    if active:
++        return {"status": "already_suspended", "reason": active.reason}
++    db.add(Suspension(author_id=author_id, title_id=title_id,
++                      reason=body.reason, suspended_by=admin.id))
++    db.commit()
++    return {"status": "suspended", "reason": body.reason}
++
++
++@app.post("/api/admin/titles/{author_id}/{title_id}/resume")
++async def admin_resume(
++    author_id: int,
++    title_id:  int,
++    admin:     User = Depends(get_current_admin),
++    db:        Session = Depends(get_db),
++):
++    active = _active_suspension(db, author_id, title_id)
++    if not active:
++        raise HTTPException(status_code=404, detail="公開停止されていません")
++    active.lifted_at = datetime.now(UTC)
++    db.commit()
++    return {"status": "resumed"}
++
++
++# ---------------------------------------------------------------------------
+ # 公開：CBZ配信
+ # ---------------------------------------------------------------------------
+ 
+@@ -818,6 +1163,7 @@
+     user_id:    int,
+     title_id:   int,
+     episode_id: int,
++    db:         Session = Depends(get_db),
+ ):
+     settings_path = (
+         FINAL_ZIP_DIR / f"user_{user_id}" / f"title_{title_id}"
+@@ -832,6 +1178,10 @@
+     if meta.get("status") != "published":
+         raise HTTPException(status_code=403, detail="この作品は非公開です")
+ 
++    _enforce_not_suspended(db, user_id, title_id)
++    _enforce_premium_access(meta, user_id, title_id, request, db)
++    _enforce_age_access(meta, user_id, request, db)
++
+     cbz_path = FINAL_ZIP_DIR / f"user_{user_id}" / f"title_{title_id}" / f"episode_{episode_id}.cbz"
+     if not cbz_path.exists():
+         raise HTTPException(status_code=404, detail="CBZファイルが見つかりません")
+@@ -852,7 +1202,8 @@
+ # ---------------------------------------------------------------------------
+ 
+ @app.get("/api/public/thumb/{user_id}/{title_id}/{episode_id}/{index}")
+-async def public_thumb(user_id: int, title_id: int, episode_id: int, index: int):
++async def public_thumb(user_id: int, title_id: int, episode_id: int, index: int,
++                       request: Request, db: Session = Depends(get_db)):
+     settings_path = (
+         FINAL_ZIP_DIR / f"user_{user_id}" / f"title_{title_id}"
+         / f"episode_{episode_id}_settings.json"
+@@ -864,6 +1215,10 @@
+     if meta.get("status") != "published":
+         raise HTTPException(status_code=403, detail="非公開です")
+ 
++    _enforce_not_suspended(db, user_id, title_id)
++    _enforce_premium_access(meta, user_id, title_id, request, db)
++    _enforce_age_access(meta, user_id, request, db)
++
+     thumb_path = (
+         FINAL_ZIP_DIR / f"user_{user_id}" / f"title_{title_id}"
+         / f"episode_{episode_id}_thumbs" / f"thumb_{index:04d}.jpg"
+@@ -880,7 +1235,7 @@
+ 
+ @app.get("/api/public/catalog")
+ @limiter.limit("5/minute", exempt_when=_is_internal_request)
+-async def public_catalog(request: Request):
++async def public_catalog(request: Request, db: Session = Depends(get_db)):
+     base_url       = str(request.base_url).rstrip("/")
+     published_list = []
+     for settings_path in FINAL_ZIP_DIR.glob("user_*/title_*/episode_*_settings.json"):
+@@ -892,12 +1247,14 @@
+             uid = meta["author_id"]
+             tid = meta["title_id"]
+             eid = meta["episode_id"]
++            if _active_suspension(db, uid, tid):
++                continue
+             meta["cbz_url"]   = f"{base_url}/api/public/cbz/{uid}/{tid}/{eid}.cbz"
+             # カバー画像URL
+             cover_path = settings_path.parent / f"episode_{eid}_cover.jpg"
+             meta["cover_url"] = (
+                 f"{base_url}/api/public/cover/{uid}/{tid}/{eid}"
+-                if cover_path.exists() else None
++                if cover_path.exists() and not meta.get("age_restricted") else None
+             )
+             # noteは公開APIから除外
+             meta.pop("note", None)
+@@ -911,7 +1268,8 @@
+ # ---------------------------------------------------------------------------
+ 
+ @app.get("/api/public/cover/{user_id}/{title_id}/{episode_id}")
+-async def public_cover(user_id: int, title_id: int, episode_id: int):
++async def public_cover(user_id: int, title_id: int, episode_id: int,
++                       db: Session = Depends(get_db)):
+     settings_path = (
+         FINAL_ZIP_DIR / f"user_{user_id}" / f"title_{title_id}"
+         / f"episode_{episode_id}_settings.json"
+@@ -923,6 +1281,10 @@
+     if meta.get("status") != "published":
+         raise HTTPException(status_code=403, detail="非公開です")
+ 
++    _enforce_not_suspended(db, user_id, title_id)
++    if meta.get("age_restricted"):
++        raise HTTPException(status_code=403, detail="年齢確認が必要な作品の表紙は表示できません")
++
+     cover_path = (
+         FINAL_ZIP_DIR / f"user_{user_id}" / f"title_{title_id}"
+         / f"episode_{episode_id}_cover.jpg"
+@@ -1038,6 +1400,7 @@
+   <a onclick="requireLogin('works-page'); loadMyWorks();">📋 マイ作品</a>
+   <a onclick="showPage('upload-page')">📤 アップロード</a>
+   <a onclick="showPage('auth-page')">🔐 アカウント</a>
++  <a id="admin-nav" style="display:none" onclick="requireLogin('admin-page'); loadAdminWorks();">🛡 管理</a>
+   <span id="login-status">未ログイン</span>
+ </nav>
+ 
+@@ -1062,6 +1425,13 @@
+   <div id="works-list"><div class="empty-state">読み込み中…</div></div>
+ </div>
+ 
++<!-- 管理者：全作品と公開停止 -->
++<div id="admin-page" class="container page">
++  <h2>🛡 管理者：全作品</h2>
++  <button class="btn btn-ghost" onclick="loadAdminWorks()" style="margin-bottom:16px">🔄 更新</button>
++  <div id="admin-works-list"><div class="empty-state">読み込み中…</div></div>
++</div>
++
+ <!-- アップロード -->
+ <div id="upload-page" class="container page">
+   <h2>📤 原稿アップロード</h2>
+@@ -1137,6 +1507,13 @@
+     </div>
+   </div>
+ 
++  <div class="form-group">
++    <label>
++      <input type="checkbox" id="age_restricted" style="width:auto;margin-right:6px">
++      年齢確認が必要な作品にする（18歳未満は閲覧できません）
++    </label>
++  </div>
++
+   <!-- Webhook設定 -->
+   <div class="form-group">
+     <label>
+@@ -1229,6 +1606,9 @@
+     <div class="form-group">
+       <label><input type="checkbox" id="edit-webhook" style="width:auto;margin-right:6px">Discord Webhook送信を許可する</label>
+     </div>
++    <div class="form-group">
++      <label><input type="checkbox" id="edit-age-restricted" style="width:auto;margin-right:6px">年齢確認が必要な作品にする</label>
++    </div>
+     <div id="edit-msg" style="margin-top:8px"></div>
+     <div class="modal-footer">
+       <button class="btn btn-ghost" onclick="closeEditModal()">キャンセル</button>
+@@ -1252,6 +1632,24 @@
+   </div>
+ </div>
+ 
++<!-- 閲覧許可モーダル -->
++<div id="grants-modal" class="modal-overlay">
++  <div class="modal">
++    <h3>🔑 閲覧許可</h3>
++    <p id="grants-target-name" style="font-weight:700;margin:12px 0;color:#1e293b"></p>
++    <input type="hidden" id="grants-title-id">
++    <div id="grants-list" style="margin-bottom:12px"></div>
++    <div style="display:flex;gap:8px">
++      <input type="text" id="grants-username" placeholder="許可するユーザー名" style="flex:1">
++      <button class="btn btn-primary" onclick="addGrant()">追加</button>
++    </div>
++    <div id="grants-msg" style="margin-top:8px"></div>
++    <div class="modal-footer">
++      <button class="btn btn-ghost" onclick="closeGrantsModal()">閉じる</button>
++    </div>
++  </div>
++</div>
++
+ <script>
+ let token = "";
+ let selectedFiles = [];
+@@ -1312,6 +1710,7 @@
+     if (!res.ok) throw new Error(data.detail || "ログイン失敗");
+     token = data.access_token;
+     document.getElementById("login-status").textContent = `👤 ${data.username}`;
++    refreshMe();
+     document.getElementById("upload-warn").style.display = "none";
+     showMsg('login-msg','success', `${data.username} としてログインしました`);
+     showPage('works-page');
+@@ -1402,10 +1801,12 @@
+                 <span class="badge ${isPublished?'badge-published':'badge-draft'}">${isPublished?'公開中':'下書き'}</span>
+                 &nbsp;
+                 <span class="badge ${w.access_level==='public'?'badge-free':'badge-premium'}">${w.access_level==='public'?'無料':'許可制'}</span>
++                ${w.age_restricted ? ' &nbsp;<span style="font-size:.72rem;color:#dc2626">🔞 年齢確認</span>' : ''}
+                 ${w.scrambled ? ' &nbsp;<span style="font-size:.72rem;color:#7c3aed">🔒 スクランブル済</span>' : ''}
+                 ${!w.has_cbz  ? ' &nbsp;<span style="color:#ef4444;font-size:.75rem">⚠ CBZ未生成</span>' : ''}
+                 ${isPublished ? ` &nbsp;<span style="font-size:.78rem;color:#64748b">👁 ${(w.view_count||0).toLocaleString()} views</span>` : ''}
+               </div>
++              ${w.suspended ? `<div style="color:#dc2626;font-weight:700;font-size:.82rem;margin-top:4px">⛔ 管理者により公開停止中${w.suspend_reason ? `（理由：${esc(w.suspend_reason)}）` : ''}</div>` : ''}
+               ${w.caption ? `<div class="work-card-caption">${esc(w.caption)}</div>` : ''}
+               ${w.note    ? `<div class="work-card-note">📝 ${esc(w.note)}</div>` : ''}
+             </div>
+@@ -1413,6 +1814,7 @@
+           <div class="work-card-actions">
+             <button class="btn btn-ghost" onclick='openEditModal(${w.title_id},${w.episode_id},${JSON.stringify(w)})'>✏️ 編集</button>
+             ${canPreview ? `<button class="btn btn-ghost" onclick="openPreview('${previewUrl}')">👁 プレビュー</button>` : ''}
++            <button class="btn btn-ghost" onclick="openGrantsModal(${w.title_id},'${titleLabel}')">🔑 閲覧許可</button>
+             <button class="btn btn-danger" style="margin-left:auto" onclick="openDeleteModal(${w.title_id},${w.episode_id},'${titleLabel} — ${episodeLabel}')">🗑 削除</button>
+           </div>
+         </div>`;
+@@ -1442,6 +1844,7 @@
+   document.getElementById('edit-status').value       = w.status;
+   document.getElementById('edit-access').value       = w.access_level;
+   document.getElementById('edit-webhook').checked    = !!w.webhook_enabled;
++  document.getElementById('edit-age-restricted').checked = !!w.age_restricted;
+   editScrambled = w.scrambled !== false;
+   editTileSize  = w.tile_size || 16;
+   document.getElementById('edit-msg').textContent    = '';
+@@ -1461,6 +1864,7 @@
+     status:          document.getElementById('edit-status').value,
+     access_level:    document.getElementById('edit-access').value,
+     webhook_enabled: document.getElementById('edit-webhook').checked,
++    age_restricted:  document.getElementById('edit-age-restricted').checked,
+     scrambled: editScrambled, tile_size: editTileSize, // 編集では既存値を維持（変更不可）
+   };
+   try {
+@@ -1611,6 +2015,7 @@
+         comment:         document.getElementById('comment').value,
+         note:            document.getElementById('note').value,
+         webhook_enabled: document.getElementById('webhook_enabled').checked,
++        age_restricted:  document.getElementById('age_restricted').checked,
+         scrambled:       scramble === '1',
+         tile_size:       parseInt(tileSize),
+       })
+@@ -1630,6 +2035,138 @@
+   }
+ }
+ 
++/* ── 自分の情報（管理者ナビの表示判定） ── */
++async function refreshMe() {
++  if (!token) return;
++  try {
++    const res = await fetch("/api/auth/me", { headers: {"Authorization":`Bearer ${token}`} });
++    if (!res.ok) return;
++    const me = await res.json();
++    document.getElementById('admin-nav').style.display = me.is_admin ? '' : 'none';
++  } catch(e) {}
++}
++
++/* ── 閲覧許可モーダル ── */
++function openGrantsModal(titleId, titleLabel) {
++  document.getElementById('grants-title-id').value = titleId;
++  document.getElementById('grants-target-name').textContent = titleLabel;
++  document.getElementById('grants-username').value = '';
++  document.getElementById('grants-msg').textContent = '';
++  document.getElementById('grants-modal').classList.add('open');
++  loadGrants();
++}
++function closeGrantsModal() { document.getElementById('grants-modal').classList.remove('open'); }
++
++async function loadGrants() {
++  const titleId = document.getElementById('grants-title-id').value;
++  const el = document.getElementById('grants-list');
++  el.innerHTML = '<div style="font-size:.85rem;color:#64748b">読み込み中…</div>';
++  try {
++    const res  = await fetch(`/api/author/titles/${titleId}/grants`, { headers: {"Authorization":`Bearer ${token}`} });
++    const data = await res.json();
++    if (!res.ok) throw new Error(data.detail || '取得失敗');
++    if (!data.length) { el.innerHTML = '<div style="font-size:.85rem;color:#64748b">許可しているユーザーはいません</div>'; return; }
++    el.innerHTML = data.map(g => `
++      <div style="display:flex;align-items:center;gap:8px;padding:4px 0">
++        <span style="flex:1">👤 ${esc(g.username)}</span>
++        <button class="btn btn-danger" onclick="removeGrant(${g.user_id})">取り消し</button>
++      </div>`).join('');
++  } catch(e) { el.innerHTML = `<div style="font-size:.85rem;color:#dc2626">${esc(e.message)}</div>`; }
++}
++
++async function addGrant() {
++  const titleId  = document.getElementById('grants-title-id').value;
++  const username = document.getElementById('grants-username').value.trim();
++  if (!username) return;
++  try {
++    const res  = await fetch(`/api/author/titles/${titleId}/grants`, {
++      method:'POST', headers:{'Content-Type':'application/json','Authorization':`Bearer ${token}`},
++      body: JSON.stringify({username})
++    });
++    const data = await res.json();
++    if (!res.ok) throw new Error(data.detail || '追加失敗');
++    showMsg('grants-msg','success', data.already ? 'すでに許可済みです' : '許可を追加しました');
++    document.getElementById('grants-username').value = '';
++    loadGrants();
++  } catch(e) { showMsg('grants-msg','error', e.message); }
++}
++
++async function removeGrant(userId) {
++  const titleId = document.getElementById('grants-title-id').value;
++  try {
++    const res  = await fetch(`/api/author/titles/${titleId}/grants/${userId}`, {
++      method:'DELETE', headers:{"Authorization":`Bearer ${token}`}
++    });
++    const data = await res.json();
++    if (!res.ok) throw new Error(data.detail || '取り消し失敗');
++    loadGrants();
++  } catch(e) { showMsg('grants-msg','error', e.message); }
++}
++
++/* ── 管理者：全作品と公開停止 ── */
++async function loadAdminWorks() {
++  if (!token) return;
++  const el = document.getElementById('admin-works-list');
++  el.innerHTML = '<div class="empty-state">読み込み中…</div>';
++  try {
++    const res   = await fetch('/api/admin/works', { headers: {"Authorization":`Bearer ${token}`} });
++    const works = await res.json();
++    if (!res.ok) throw new Error(works.detail || '取得失敗');
++    if (!works.length) { el.innerHTML = '<div class="empty-state">作品がありません</div>'; return; }
++    const groups = new Map();
++    for (const w of works) {
++      const key = `${w.author_id}/${w.title_id}`;
++      if (!groups.has(key)) groups.set(key, {
++        author_id: w.author_id, title_id: w.title_id,
++        author_name: w.author_name || '', title_name: w.title_name || `作品${w.title_id}`,
++        suspended: !!w.suspended, suspend_reason: w.suspend_reason || '', episodes: [],
++      });
++      groups.get(key).episodes.push(w);
++    }
++    el.innerHTML = [...groups.values()].map(g => {
++      const eps = g.episodes.map(w =>
++        `${esc(w.episode_name || `エピソード${w.episode_id}`)}（${w.status==='published'?'公開中':'下書き'}・${w.access_level==='public'?'無料':'許可制'}）`
++      ).join('、');
++      const controls = g.suspended
++        ? `<span style="color:#dc2626;font-weight:700">⛔ 公開停止中</span>
++           <button class="btn btn-primary" onclick="adminResume(${g.author_id},${g.title_id})">解除する</button>`
++        : `<input type="text" id="suspend-reason-${g.author_id}-${g.title_id}" placeholder="停止の理由（任意）" style="flex:1;min-width:160px">
++           <button class="btn btn-danger" onclick="adminSuspend(${g.author_id},${g.title_id})">公開を停止</button>`;
++      return `
++        <div class="work-card">
++          <div class="work-card-title">${esc(g.title_name)} <span style="font-weight:400;color:#64748b;font-size:.8rem">👤 ${esc(g.author_name)}</span></div>
++          <div class="work-card-sub" style="margin:6px 0">${eps}</div>
++          ${g.suspended && g.suspend_reason ? `<div style="font-size:.8rem;color:#475569">理由：${esc(g.suspend_reason)}</div>` : ''}
++          <div class="work-card-actions">${controls}</div>
++        </div>`;
++    }).join('');
++  } catch(e) { el.innerHTML = `<div class="empty-state">エラー: ${esc(e.message)}</div>`; }
++}
++
++async function adminSuspend(authorId, titleId) {
++  const reason = document.getElementById(`suspend-reason-${authorId}-${titleId}`).value;
++  try {
++    const res  = await fetch(`/api/admin/titles/${authorId}/${titleId}/suspend`, {
++      method:'POST', headers:{'Content-Type':'application/json','Authorization':`Bearer ${token}`},
++      body: JSON.stringify({reason})
++    });
++    const data = await res.json();
++    if (!res.ok) throw new Error(data.detail || '停止失敗');
++    loadAdminWorks();
++  } catch(e) { alert(e.message); }
++}
++
++async function adminResume(authorId, titleId) {
++  try {
++    const res  = await fetch(`/api/admin/titles/${authorId}/${titleId}/resume`, {
++      method:'POST', headers:{"Authorization":`Bearer ${token}`}
++    });
++    const data = await res.json();
++    if (!res.ok) throw new Error(data.detail || '解除失敗');
++    loadAdminWorks();
++  } catch(e) { alert(e.message); }
++}
++
+ /* ── ユーティリティ ── */
+ function esc(str) {
+   return String(str||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+diff a/tests/test_access_phase1.py b/tests/test_access_phase1.py
+--- a/tests/test_access_phase1.py	1970-01-01 09:00:00.000000000 +0900
++++ b/tests/test_access_phase1.py	2026-11-06 22:31:26.196217819 +0900
+@@ -0,0 +1,313 @@
++"""段階1（基盤と執行）の検証。
++
++- アカウント種別（author/reader）と年齢申告
++- premium エピソードの CBZ／サムネイルはグラント必須
++- 管理者による公開停止が全配信面に効き、作家の操作では外せない
++- 年齢対象の公開作品はカタログで表紙が出ず、公開表紙も返らない
++  （CBZ は閲覧側ゲート担当なのでプラットフォームでは開いたまま）
++"""
++import json
++
++import pytest
++
++
++@pytest.fixture(autouse=True)
++def _reset_limits(platform):
++    platform.limiter.reset()
++
++
++def _token(client, username, password="password123"):
++    r = client.post("/api/auth/token", data={"username": username, "password": password})
++    assert r.status_code == 200, r.text
++    return r.json()["access_token"]
++
++
++def _auth(token):
++    return {"Authorization": f"Bearer {token}"}
++
++
++def _publish(platform, author_id, author_name, title_id, episode_id=1,
++             access_level="public", age_restricted=False, status="published"):
++    d = platform.FINAL_ZIP_DIR / f"user_{author_id}" / f"title_{title_id}"
++    d.mkdir(parents=True, exist_ok=True)
++    meta = {
++        "status": status, "access_level": access_level,
++        "age_restricted": age_restricted,
++        "title_name": f"作品{title_id}", "episode_name": "第1話",
++        "caption": "", "comment": "", "note": "内部メモ",
++        "scrambled": True, "tile_size": 16, "webhook_enabled": False,
++        "author_name": author_name, "author_id": author_id,
++        "title_id": title_id, "episode_id": episode_id,
++    }
++    (d / f"episode_{episode_id}_settings.json").write_text(
++        json.dumps(meta, ensure_ascii=False))
++    (d / f"episode_{episode_id}.cbz").write_bytes(b"PK\x03\x04dummy-cbz")
++    (d / f"episode_{episode_id}_cover.jpg").write_bytes(b"\xff\xd8\xffcover")
++    thumbs = d / f"episode_{episode_id}_thumbs"
++    thumbs.mkdir(exist_ok=True)
++    (thumbs / "thumb_0000.jpg").write_bytes(b"\xff\xd8\xffthumb")
++    return meta
++
++
++def _cbz(client, author_id, title_id, token=None):
++    return client.get(f"/api/public/cbz/{author_id}/{title_id}/1.cbz",
++                      headers=_auth(token) if token else {})
++
++
++@pytest.fixture(scope="module")
++def users(platform, platform_client):
++    """DB 直作りのユーザー（author 群）と、API 登録の reader。"""
++    import bcrypt as _bcrypt
++    db = platform.SessionLocal()
++    ids = {}
++    for name in ("p1_author", "p1_other", "p1_young", "p1_admin"):
++        u = platform.User(
++            username=name, email=f"{name}@example.com",
++            hashed_password=_bcrypt.hashpw(b"password123", _bcrypt.gensalt()).decode(),
++            is_active=True)
++        db.add(u)
++        db.commit()
++        db.refresh(u)
++        ids[name] = u.id
++    db.close()
++    r = platform_client.post("/api/auth/signup", json={
++        "username": "p1_reader", "email": "p1_reader@example.com",
++        "password": "password123", "account_type": "reader",
++    })
++    assert r.status_code == 200, r.text
++    return ids
++
++
++@pytest.fixture()
++def author(users, platform_client):
++    return users["p1_author"], _token(platform_client, "p1_author")
++
++
++@pytest.fixture()
++def reader(users, platform_client):
++    return _token(platform_client, "p1_reader")
++
++
++@pytest.fixture()
++def admin(users, platform_client, monkeypatch):
++    monkeypatch.setenv("MANGA_ADMIN_USERS", "p1_admin")
++    return _token(platform_client, "p1_admin")
++
++
++# ---------------------------------------------------------------------------
++# アカウント種別・年齢申告
++# ---------------------------------------------------------------------------
++
++def test_signup_defaults_to_author(platform_client):
++    r = platform_client.post("/api/auth/signup", json={
++        "username": "p1_default", "email": "p1_default@example.com",
++        "password": "password123",
++    })
++    assert r.status_code == 200
++    token = _token(platform_client, "p1_default")
++    me = platform_client.get("/api/auth/me", headers=_auth(token)).json()
++    assert me["account_type"] == "author"
++    assert me["is_admin"] is False
++    assert me["adult_declared_at"] is None
++
++
++def test_signup_rejects_bad_account_type(platform_client):
++    r = platform_client.post("/api/auth/signup", json={
++        "username": "p1_bad", "email": "p1_bad@example.com",
++        "password": "password123", "account_type": "superuser",
++    })
++    assert r.status_code == 400
++
++
++def test_reader_cannot_use_author_endpoints(platform_client, reader):
++    me = platform_client.get("/api/auth/me", headers=_auth(reader)).json()
++    assert me["account_type"] == "reader"
++    r = platform_client.get("/api/author/works", headers=_auth(reader))
++    assert r.status_code == 403
++
++
++def test_declare_adult_is_sticky(platform_client, reader):
++    r = platform_client.post("/api/auth/declare-adult", headers=_auth(reader))
++    assert r.status_code == 200
++    first = r.json()["adult_declared_at"]
++    assert first
++    r = platform_client.post("/api/auth/declare-adult", headers=_auth(reader))
++    assert r.json()["adult_declared_at"] == first
++    me = platform_client.get("/api/auth/me", headers=_auth(reader)).json()
++    assert me["adult_declared_at"] == first
++
++
++# ---------------------------------------------------------------------------
++# グラントと premium 執行
++# ---------------------------------------------------------------------------
++
++def test_premium_cbz_flow(platform, platform_client, author, reader):
++    author_id, author_token = author
++    _publish(platform, author_id, "p1_author", title_id=101, access_level="premium")
++
++    assert _cbz(platform_client, author_id, 101).status_code == 401          # 匿名
++    assert _cbz(platform_client, author_id, 101, reader).status_code == 403  # 許可なし
++    assert _cbz(platform_client, author_id, 101, author_token).status_code == 200  # 本人
++
++    # サムネイルも同じ門
++    r = platform_client.get(f"/api/public/thumb/{author_id}/101/1/0")
++    assert r.status_code == 401
++
++    # 許可を出す
++    r = platform_client.post("/api/author/titles/101/grants",
++                             json={"username": "p1_reader"}, headers=_auth(author_token))
++    assert r.status_code == 200 and r.json()["already"] is False
++    r = platform_client.post("/api/author/titles/101/grants",
++                             json={"username": "p1_reader"}, headers=_auth(author_token))
++    assert r.json()["already"] is True  # 冪等
++
++    grants = platform_client.get("/api/author/titles/101/grants",
++                                 headers=_auth(author_token)).json()
++    assert [g["username"] for g in grants] == ["p1_reader"]
++
++    assert _cbz(platform_client, author_id, 101, reader).status_code == 200
++    r = platform_client.get(f"/api/public/thumb/{author_id}/101/1/0", headers=_auth(reader))
++    assert r.status_code == 200
++
++    # 取り消すとまた読めない
++    reader_id = grants[0]["user_id"]
++    r = platform_client.delete(f"/api/author/titles/101/grants/{reader_id}",
++                               headers=_auth(author_token))
++    assert r.status_code == 200
++    assert _cbz(platform_client, author_id, 101, reader).status_code == 403
++    r = platform_client.delete(f"/api/author/titles/101/grants/{reader_id}",
++                               headers=_auth(author_token))
++    assert r.status_code == 404
++
++
++def test_grant_api_rules(platform, platform_client, author):
++    author_id, author_token = author
++    _publish(platform, author_id, "p1_author", title_id=102, access_level="premium")
++    other_token = _token(platform_client, "p1_other")
++
++    # 存在しないユーザー
++    r = platform_client.post("/api/author/titles/102/grants",
++                             json={"username": "no_such_user"}, headers=_auth(author_token))
++    assert r.status_code == 404
++    # 存在しない作品
++    r = platform_client.post("/api/author/titles/999/grants",
++                             json={"username": "p1_reader"}, headers=_auth(author_token))
++    assert r.status_code == 404
++    # 他人の作品には出せない（自分のフォルダに無いので 404）
++    r = platform_client.post("/api/author/titles/102/grants",
++                             json={"username": "p1_reader"}, headers=_auth(other_token))
++    assert r.status_code == 404
++    # 自分自身には出せない
++    r = platform_client.post("/api/author/titles/102/grants",
++                             json={"username": "p1_author"}, headers=_auth(author_token))
++    assert r.status_code == 400
++
++
++def test_premium_age_combination(platform, platform_client, author, reader):
++    author_id, author_token = author
++    _publish(platform, author_id, "p1_author", title_id=103,
++             access_level="premium", age_restricted=True)
++    platform_client.post("/api/auth/declare-adult", headers=_auth(reader))
++    platform_client.post("/api/author/titles/103/grants",
++                         json={"username": "p1_reader"}, headers=_auth(author_token))
++    assert _cbz(platform_client, author_id, 103, reader).status_code == 200
++
++
++def test_premium_age_blocks_undeclared(platform, platform_client, author):
++    author_id, author_token = author
++    _publish(platform, author_id, "p1_author", title_id=104,
++             access_level="premium", age_restricted=True)
++    young = _token(platform_client, "p1_young")
++    platform_client.post("/api/author/titles/104/grants",
++                         json={"username": "p1_young"}, headers=_auth(author_token))
++    r = _cbz(platform_client, author_id, 104, young)
++    assert r.status_code == 403
++    assert "年齢確認" in r.json()["detail"]
++
++
++# ---------------------------------------------------------------------------
++# 管理者による公開停止
++# ---------------------------------------------------------------------------
++
++def test_admin_endpoints_require_admin(platform_client, author):
++    _, author_token = author
++    r = platform_client.get("/api/admin/works", headers=_auth(author_token))
++    assert r.status_code == 403
++
++
++def test_suspension_flow(platform, platform_client, author, reader, admin):
++    author_id, author_token = author
++    _publish(platform, author_id, "p1_author", title_id=105, access_level="premium")
++    platform_client.post("/api/author/titles/105/grants",
++                         json={"username": "p1_reader"}, headers=_auth(author_token))
++    assert _cbz(platform_client, author_id, 105, reader).status_code == 200
++
++    r = platform_client.post(f"/api/admin/titles/{author_id}/105/suspend",
++                             json={"reason": "権利者からの申告"}, headers=_auth(admin))
++    assert r.status_code == 200 and r.json()["status"] == "suspended"
++    r = platform_client.post(f"/api/admin/titles/{author_id}/105/suspend",
++                             json={"reason": "重ねて"}, headers=_auth(admin))
++    assert r.json()["status"] == "already_suspended"
++
++    # 全配信面が止まる
++    assert _cbz(platform_client, author_id, 105, reader).status_code == 403
++    assert platform_client.get(f"/api/public/cover/{author_id}/105/1").status_code == 403
++    assert platform_client.get(f"/api/public/thumb/{author_id}/105/1/0",
++                               headers=_auth(reader)).status_code == 403
++    catalog = platform_client.get("/api/public/catalog").json()
++    assert not [m for m in catalog if m["author_id"] == author_id and m["title_id"] == 105]
++
++    # 管理一覧では停止が見える
++    works = platform_client.get("/api/admin/works", headers=_auth(admin)).json()
++    entry = [w for w in works if w["author_id"] == author_id and w["title_id"] == 105]
++    assert entry and entry[0]["suspended"] is True
++    assert entry[0]["suspend_reason"] == "権利者からの申告"
++
++    # 作家が設定を保存し直しても停止は外れない
++    r = platform_client.patch("/api/author/titles/105/episodes/1/settings", json={
++        "status": "published", "access_level": "premium", "title_name": "作品105",
++        "episode_name": "第1話", "caption": "", "comment": "", "note": "",
++        "scrambled": True, "tile_size": 16, "webhook_enabled": False,
++        "age_restricted": False,
++    }, headers=_auth(author_token))
++    assert r.status_code == 200
++    assert _cbz(platform_client, author_id, 105, reader).status_code == 403
++
++    # 解除で元に戻る
++    r = platform_client.post(f"/api/admin/titles/{author_id}/105/resume",
++                             headers=_auth(admin))
++    assert r.status_code == 200
++    assert _cbz(platform_client, author_id, 105, reader).status_code == 200
++    r = platform_client.post(f"/api/admin/titles/{author_id}/105/resume",
++                             headers=_auth(admin))
++    assert r.status_code == 404
++
++
++# ---------------------------------------------------------------------------
++# 年齢対象の公開作品と、通常作品の回帰
++# ---------------------------------------------------------------------------
++
++def test_age_public_cover_hidden(platform, platform_client, author, reader):
++    author_id, author_token = author
++    _publish(platform, author_id, "p1_author", title_id=106, age_restricted=True)
++    catalog = platform_client.get("/api/public/catalog").json()
++    entry = [m for m in catalog if m["author_id"] == author_id and m["title_id"] == 106]
++    assert entry and entry[0]["cover_url"] is None
++    assert entry[0]["age_restricted"] is True
++    assert platform_client.get(f"/api/public/cover/{author_id}/106/1").status_code == 403
++    # 段階4で CBZ も閉じた：匿名は 403、作者本人と申告済み読者は取得できる
++    assert _cbz(platform_client, author_id, 106).status_code == 403
++    assert _cbz(platform_client, author_id, 106, author_token).status_code == 200
++    platform_client.post("/api/auth/declare-adult", headers=_auth(reader))
++    assert _cbz(platform_client, author_id, 106, reader).status_code == 200
++
++
++def test_plain_public_unchanged(platform, platform_client, author):
++    author_id, _ = author
++    _publish(platform, author_id, "p1_author", title_id=107)
++    catalog = platform_client.get("/api/public/catalog").json()
++    entry = [m for m in catalog if m["author_id"] == author_id and m["title_id"] == 107]
++    assert entry and entry[0]["cover_url"]
++    assert _cbz(platform_client, author_id, 107).status_code == 200
++    assert platform_client.get(f"/api/public/cover/{author_id}/107/1").status_code == 200
++    assert platform_client.get(f"/api/public/thumb/{author_id}/107/1/0").status_code == 200
+diff a/tests/test_access_phase2.py b/tests/test_access_phase2.py
+--- a/tests/test_access_phase2.py	1970-01-01 09:00:00.000000000 +0900
++++ b/tests/test_access_phase2.py	2026-11-06 22:31:26.174444923 +0900
+@@ -0,0 +1,155 @@
++"""段階2（プラットフォーム画面）の検証。
++
++画面そのものは GET / の HTML と JS 構文で確認し、画面が依存する
++API 側（マイ作品への停止注釈、年齢フラグの往復）を実エンドポイントで確認する。
++"""
++import json
++import re
++import shutil
++import subprocess
++
++import pytest
++
++
++@pytest.fixture(autouse=True)
++def _reset_limits(platform):
++    platform.limiter.reset()
++
++
++def _token(client, username, password="password123"):
++    r = client.post("/api/auth/token", data={"username": username, "password": password})
++    assert r.status_code == 200, r.text
++    return r.json()["access_token"]
++
++
++def _auth(token):
++    return {"Authorization": f"Bearer {token}"}
++
++
++@pytest.fixture(scope="module")
++def users(platform):
++    import bcrypt as _bcrypt
++    db = platform.SessionLocal()
++    ids = {}
++    for name in ("p2_author", "p2_admin"):
++        u = platform.User(
++            username=name, email=f"{name}@example.com",
++            hashed_password=_bcrypt.hashpw(b"password123", _bcrypt.gensalt()).decode(),
++            is_active=True)
++        db.add(u)
++        db.commit()
++        db.refresh(u)
++        ids[name] = u.id
++    db.close()
++    return ids
++
++
++@pytest.fixture()
++def author(users, platform_client):
++    return users["p2_author"], _token(platform_client, "p2_author")
++
++
++@pytest.fixture()
++def admin(users, platform_client, monkeypatch):
++    monkeypatch.setenv("MANGA_ADMIN_USERS", "p2_admin")
++    return _token(platform_client, "p2_admin")
++
++
++def _publish(platform, author_id, title_id=201):
++    d = platform.FINAL_ZIP_DIR / f"user_{author_id}" / f"title_{title_id}"
++    d.mkdir(parents=True, exist_ok=True)
++    meta = {
++        "status": "published", "access_level": "public", "age_restricted": False,
++        "title_name": f"作品{title_id}", "episode_name": "第1話",
++        "caption": "", "comment": "", "note": "",
++        "scrambled": True, "tile_size": 16, "webhook_enabled": False,
++        "author_name": "p2_author", "author_id": author_id,
++        "title_id": title_id, "episode_id": 1,
++    }
++    (d / "episode_1_settings.json").write_text(json.dumps(meta, ensure_ascii=False))
++    (d / "episode_1.cbz").write_bytes(b"PK\x03\x04dummy-cbz")
++    return meta
++
++
++# ---------------------------------------------------------------------------
++# 画面の存在と JS 構文
++# ---------------------------------------------------------------------------
++
++def test_root_html_has_phase2_ui(platform, platform_client):
++    r = platform_client.get("/")
++    assert r.status_code == 200
++    html = r.text
++    for marker in (
++        'id="admin-nav"', 'id="admin-page"', 'id="admin-works-list"',
++        'id="age_restricted"', 'id="edit-age-restricted"',
++        'id="grants-modal"', 'id="grants-username"',
++        "loadAdminWorks", "openGrantsModal", "refreshMe",
++        "管理者により公開停止中", "年齢確認が必要な作品にする",
++    ):
++        assert marker in html, marker
++
++
++def test_embedded_script_is_valid_js(platform, tmp_path):
++    node = shutil.which("node")
++    if not node:
++        pytest.skip("node が無い環境では JS 構文検査をスキップ")
++    scripts = re.findall(r"<script>(.*?)</script>", platform.index_html_content, re.S)
++    assert len(scripts) == 1
++    js_file = tmp_path / "ui.js"
++    js_file.write_text(scripts[0], encoding="utf-8")
++    r = subprocess.run([node, "--check", str(js_file)],
++                       capture_output=True, text=True)
++    assert r.returncode == 0, r.stderr
++
++
++# ---------------------------------------------------------------------------
++# マイ作品への停止注釈
++# ---------------------------------------------------------------------------
++
++def test_works_suspension_annotation(platform, platform_client, author, admin):
++    author_id, author_token = author
++    _publish(platform, author_id, title_id=201)
++
++    works = platform_client.get("/api/author/works", headers=_auth(author_token)).json()
++    entry = [w for w in works if w["title_id"] == 201]
++    assert entry and entry[0]["suspended"] is False
++    assert entry[0]["suspend_reason"] is None
++
++    platform_client.post(f"/api/admin/titles/{author_id}/201/suspend",
++                         json={"reason": "確認のため"}, headers=_auth(admin))
++    works = platform_client.get("/api/author/works", headers=_auth(author_token)).json()
++    entry = [w for w in works if w["title_id"] == 201]
++    assert entry[0]["suspended"] is True
++    assert entry[0]["suspend_reason"] == "確認のため"
++
++    platform_client.post(f"/api/admin/titles/{author_id}/201/resume", headers=_auth(admin))
++    works = platform_client.get("/api/author/works", headers=_auth(author_token)).json()
++    entry = [w for w in works if w["title_id"] == 201]
++    assert entry[0]["suspended"] is False
++
++
++# ---------------------------------------------------------------------------
++# 年齢フラグの往復（編集画面の保存経路）
++# ---------------------------------------------------------------------------
++
++def test_age_flag_roundtrip(platform, platform_client, author):
++    author_id, author_token = author
++    _publish(platform, author_id, title_id=202)
++    payload = {
++        "status": "published", "access_level": "public",
++        "title_name": "作品202", "episode_name": "第1話",
++        "caption": "", "comment": "", "note": "",
++        "scrambled": True, "tile_size": 16, "webhook_enabled": False,
++        "age_restricted": True,
++    }
++    r = platform_client.patch("/api/author/titles/202/episodes/1/settings",
++                              json=payload, headers=_auth(author_token))
++    assert r.status_code == 200
++
++    works = platform_client.get("/api/author/works", headers=_auth(author_token)).json()
++    entry = [w for w in works if w["title_id"] == 202]
++    assert entry[0]["age_restricted"] is True
++
++    catalog = platform_client.get("/api/public/catalog").json()
++    entry = [m for m in catalog if m["author_id"] == author_id and m["title_id"] == 202]
++    assert entry and entry[0]["age_restricted"] is True
+diff a/tests/test_access_phase3.py b/tests/test_access_phase3.py
+--- a/tests/test_access_phase3.py	1970-01-01 09:00:00.000000000 +0900
++++ b/tests/test_access_phase3.py	2026-11-06 22:31:26.185370951 +0900
+@@ -0,0 +1,324 @@
++"""段階3（閲覧側：読者ログイン・施錠表示・unlock）の検証。
++
++プラットフォームは実サーバー（uvicorn スレッド）で起動し、閲覧側は
++そちらを向くよう PLATFORM_BASE_URL を差し替えて、HTTP 越しの実フローで確認する。
++"""
++import hashlib
++import io
++import json
++import socket
++import threading
++import time
++import zipfile
++
++import httpx
++import pytest
++from fastapi.testclient import TestClient
++
++def _make_png():
++    from PIL import Image
++    buf = io.BytesIO()
++    Image.new("RGB", (10, 10), (255, 0, 0)).save(buf, format="PNG")
++    return buf.getvalue()
++
++
++PNG_BYTES = _make_png()
++
++
++@pytest.fixture(autouse=True)
++def _reset(platform, viewer):
++    platform.limiter.reset()
++    viewer.limiter.reset()
++    viewer._catalog_cache.update({"ts": 0.0, "data": None})
++    viewer._grants_cache.clear()
++    viewer._auth_store.clear()
++
++
++def _free_port():
++    s = socket.socket()
++    s.bind(("127.0.0.1", 0))
++    port = s.getsockname()[1]
++    s.close()
++    return port
++
++
++@pytest.fixture(scope="module")
++def live_platform(platform):
++    import uvicorn
++    # この検証環境には外向きプロキシの環境変数があり、httpx/requests が
++    # localhost 宛てでも掴んで壊れるため、テスト中だけ外す（本番コードは不変）。
++    import os
++    for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
++                "http_proxy", "https_proxy", "all_proxy", "no_proxy"):
++        os.environ.pop(var, None)
++    port = _free_port()
++    base = f"http://127.0.0.1:{port}"
++    config = uvicorn.Config(platform.app, host="127.0.0.1", port=port, log_level="error")
++    server = uvicorn.Server(config)
++    thread = threading.Thread(target=server.run, daemon=True)
++    thread.start()
++    deadline = time.time() + 15
++    while time.time() < deadline:
++        try:
++            if httpx.get(f"{base}/api/public/catalog", timeout=1.0).status_code == 200:
++                break
++        except Exception:
++            time.sleep(0.1)
++    else:
++        raise RuntimeError("platform server did not start")
++    yield base
++    server.should_exit = True
++    thread.join(timeout=5)
++
++
++@pytest.fixture()
++def env(viewer, live_platform, monkeypatch):
++    monkeypatch.setattr(viewer, "PLATFORM_BASE_URL", live_platform)
++    monkeypatch.setenv("PLATFORM_BASE_URL", live_platform)
++    return live_platform
++
++
++@pytest.fixture()
++def vclient(viewer):
++    # with で入ると lifespan の終了処理が共有 executor を止めてしまうため、
++    # コンテキストなしで使う（TestClient は未入場でもリクエストできる）
++    yield TestClient(viewer.app)
++
++
++def _make_user(platform, username, account_type="author"):
++    import bcrypt as _bcrypt
++    db = platform.SessionLocal()
++    u = platform.User(
++        username=username, email=f"{username}@example.com",
++        hashed_password=_bcrypt.hashpw(b"password123", _bcrypt.gensalt()).decode(),
++        is_active=True, account_type=account_type)
++    db.add(u)
++    db.commit()
++    db.refresh(u)
++    uid = u.id
++    db.close()
++    return uid
++
++
++@pytest.fixture(scope="module")
++def people(platform):
++    return {
++        "author":  _make_user(platform, "p3_author"),
++        "reader1": _make_user(platform, "p3_reader1", "reader"),
++        "reader2": _make_user(platform, "p3_reader2", "reader"),
++    }
++
++
++def _publish(platform, author_id, title_id, access_level):
++    d = platform.FINAL_ZIP_DIR / f"user_{author_id}" / f"title_{title_id}"
++    d.mkdir(parents=True, exist_ok=True)
++    meta = {
++        "status": "published", "access_level": access_level, "age_restricted": False,
++        "title_name": f"作品{title_id}", "episode_name": "第1話",
++        "caption": "", "comment": "", "note": "",
++        "scrambled": False, "tile_size": 16, "webhook_enabled": False,
++        "author_name": "p3_author", "author_id": author_id,
++        "title_id": title_id, "episode_id": 1,
++    }
++    (d / "episode_1_settings.json").write_text(json.dumps(meta, ensure_ascii=False))
++    buf = io.BytesIO()
++    with zipfile.ZipFile(buf, "w") as z:
++        z.writestr("page1.png", PNG_BYTES)
++    (d / "episode_1.cbz").write_bytes(buf.getvalue())
++    return f"/api/public/cbz/{author_id}/{title_id}/1.cbz"
++
++
++def _grant(platform, author_id, title_id, user_id):
++    db = platform.SessionLocal()
++    db.add(platform.Grant(author_id=author_id, title_id=title_id, user_id=user_id))
++    db.commit()
++    db.close()
++
++
++def _login(vclient, username):
++    r = vclient.post("/auth/login", data={"username": username, "password": "password123"})
++    assert r.status_code == 200, r.text
++    return r
++
++
++def _cbz_url(base, path):
++    return base + path
++
++
++# ---------------------------------------------------------------------------
++# 登録・ログイン・ログアウト
++# ---------------------------------------------------------------------------
++
++def test_register_login_logout(platform, viewer, env, vclient):
++    r = vclient.get("/auth/me")
++    assert r.status_code == 401
++
++    r = vclient.post("/auth/register", data={
++        "username": "p3_newbie", "email": "p3_newbie@example.com",
++        "password": "password123"})
++    assert r.status_code == 200, r.text
++    assert "viewer_auth" in r.headers.get("set-cookie", "")
++
++    db = platform.SessionLocal()
++    u = db.query(platform.User).filter_by(username="p3_newbie").one()
++    assert u.account_type == "reader"
++    db.close()
++
++    r = vclient.get("/auth/me")
++    assert r.status_code == 200
++    assert r.json()["username"] == "p3_newbie"
++    assert r.json()["account_type"] == "reader"
++
++    r = vclient.post("/auth/logout")
++    assert r.status_code == 200
++    assert vclient.get("/auth/me").status_code == 401
++
++    r = vclient.post("/auth/login", data={"username": "p3_newbie", "password": "wrong-pass"})
++    assert r.status_code == 401
++    r = _login(vclient, "p3_newbie")
++    assert r.json()["username"] == "p3_newbie"
++
++
++def test_my_grants_endpoint(platform, platform_client, people):
++    author, reader = people["author"], people["reader1"]
++    r = platform_client.post("/api/auth/token",
++                             data={"username": "p3_reader1", "password": "password123"})
++    token = r.json()["access_token"]
++    h = {"Authorization": f"Bearer {token}"}
++    got = platform_client.get("/api/auth/grants", headers=h).json()
++    assert all(not (g["author_id"] == author and g["title_id"] == 399) for g in got)
++    _grant(platform, author, 399, reader)
++    got = platform_client.get("/api/auth/grants", headers=h).json()
++    assert {"author_id": author, "title_id": 399} in got
++
++
++# ---------------------------------------------------------------------------
++# 施錠表示（カタログ）
++# ---------------------------------------------------------------------------
++
++def test_catalog_lock_marks(platform, env, vclient, people):
++    base = env
++    _publish(platform, people["author"], 301, "premium")
++    _grant(platform, people["author"], 301, people["reader1"])
++
++    r = vclient.get("/public")
++    assert r.status_code == 200
++    assert "🔒 許可制" in r.text
++    assert "許可制・読めます" not in r.text
++
++    _login(vclient, "p3_reader1")
++    r = vclient.get("/public")
++    assert "許可制・読めます" in r.text
++
++
++# ---------------------------------------------------------------------------
++# unlock の実フロー
++# ---------------------------------------------------------------------------
++
++def test_premium_unlock_flow(platform, viewer, env, vclient, people):
++    import manga as mg
++    base = env
++    author = people["author"]
++    url = _cbz_url(base, _publish(platform, author, 302, "premium"))
++
++    # 匿名ではセッション自体がもらえない
++    r = vclient.get("/session", params={"url": url})
++    assert r.status_code == 401
++
++    # 許可のない読者：セッションは出るが、ダウンロードでプラットフォームに拒否される
++    _login(vclient, "p3_reader2")
++    r = vclient.get("/session", params={"url": url})
++    assert r.status_code == 200
++    token2 = r.json()["session_token"]
++    r = vclient.get("/download/start", params={"url": url, "session_token": token2})
++    assert "error:" in r.text
++    assert not __import__("os").path.exists(mg.get_cache_path(url) + ".cbz")
++
++    # 許可のある読者：ダウンロードでき、ページが読める
++    _grant(platform, author, 302, people["reader1"])
++    if True:
++        c1 = TestClient(viewer.app)
++        _login(c1, "p3_reader1")
++        r = c1.get("/session", params={"url": url})
++        assert r.status_code == 200
++        token1 = r.json()["session_token"]
++        r = c1.get("/download/start", params={"url": url, "session_token": token1})
++        assert "data: done" in r.text
++
++        r = c1.get("/images", params={"url": url, "session_token": token1})
++        assert r.status_code == 200
++        assert "page1.png" in r.text
++
++        # 展開時に連番が付くため、/images が返した実URLで画像を取りにいく
++        import re as _re
++        m = _re.search(r"/image/[^\"']+", r.text)
++        assert m, r.text[:300]
++        image_path = m.group(0)
++        r = c1.get(image_path)
++        assert r.status_code == 200
++        assert r.headers["content-type"].startswith("image/")
++        assert len(r.content) > 0
++
++        # 別ユーザー（許可なし）の cookie では他人のセッションを使えない
++        if True:
++            c2 = TestClient(viewer.app)
++            _login(c2, "p3_reader2")
++            r = c2.get("/images", params={"url": url, "session_token": token1})
++            assert r.status_code == 403
++            r = c2.get(image_path)
++            assert r.status_code == 403
++
++        # cookie が無ければ同じセッションでも使えない
++        if True:
++            c3 = TestClient(viewer.app)
++            r = c3.get("/images", params={"url": url, "session_token": token1})
++            assert r.status_code == 403
++
++
++def test_public_work_stays_open(platform, env, vclient, people):
++    base = env
++    url = _cbz_url(base, _publish(platform, people["author"], 303, "public"))
++    r = vclient.get("/session", params={"url": url})
++    assert r.status_code == 200
++    token = r.json()["session_token"]
++    r = vclient.get("/download/start", params={"url": url, "session_token": token})
++    assert "data: done" in r.text
++    r = vclient.get("/images", params={"url": url, "session_token": token})
++    assert r.status_code == 200
++    assert "page1.png" in r.text
++
++
++def test_reader_page_lock_banner(platform, env, vclient, people):
++    base = env
++    url = _cbz_url(base, _publish(platform, people["author"], 305, "premium"))
++    r = vclient.get("/reader", params={"url": url})
++    assert r.status_code == 200
++    assert 'id="lock-msg"' in r.text
++    assert "この作品は許可制です" in r.text  # 未ログイン向けの案内が初期表示される
++    assert "showLock" in r.text
++
++    r = vclient.get("/public")
++    assert 'id="auth-forms"' in r.text  # base のログインUI
++
++
++def test_download_file_auth_header(platform, env, tmp_path, people):
++    import manga as mg
++    base = env
++    author = people["author"]
++    url = _cbz_url(base, _publish(platform, author, 304, "premium"))
++    _grant(platform, author, 304, people["reader1"])
++
++    # トークンなしではプラットフォームが拒否する
++    dest = str(tmp_path / "a.cbz")
++    ok, err = mg.download_file(url, dest)
++    assert ok is False
++
++    # 読者トークンを併送すれば取得できる
++    from fastapi.testclient import TestClient as TC
++    with TC(platform.app) as pc:
++        r = pc.post("/api/auth/token",
++                    data={"username": "p3_reader1", "password": "password123"})
++        reader_token = r.json()["access_token"]
++    dest = str(tmp_path / "b.cbz")
++    ok, err = mg.download_file(url, dest, auth_token=reader_token)
++    assert ok is True, err
+diff a/tests/test_access_phase4.py b/tests/test_access_phase4.py
+--- a/tests/test_access_phase4.py	1970-01-01 09:00:00.000000000 +0900
++++ b/tests/test_access_phase4.py	2026-11-06 22:31:26.196331861 +0900
+@@ -0,0 +1,278 @@
++"""段階4（年齢確認）の検証。
++
++プラットフォーム側：年齢対象の無料作品の CBZ／サムネイルを閉じる。
++閲覧側：匿名はセッション申告ゲート、ログイン中はアカウント申告と連携し、
++premium＋年齢の複合判定までを実フロー（実サーバー越し）で確認する。
++"""
++import io
++import json
++import socket
++import threading
++import time
++import zipfile
++
++import httpx
++import pytest
++from fastapi.testclient import TestClient
++
++JPG_BYTES = b"\xff\xd8\xff\xe0" + b"\x00" * 32
++
++
++def _make_png():
++    from PIL import Image
++    buf = io.BytesIO()
++    Image.new("RGB", (10, 10), (0, 0, 255)).save(buf, format="PNG")
++    return buf.getvalue()
++
++
++PNG_BYTES = _make_png()
++
++
++@pytest.fixture(autouse=True)
++def _reset(platform, viewer):
++    platform.limiter.reset()
++    viewer.limiter.reset()
++    viewer._catalog_cache.update({"ts": 0.0, "data": None})
++    viewer._grants_cache.clear()
++    viewer._auth_store.clear()
++    viewer._age_gate_store.clear()
++
++
++def _free_port():
++    s = socket.socket()
++    s.bind(("127.0.0.1", 0))
++    port = s.getsockname()[1]
++    s.close()
++    return port
++
++
++@pytest.fixture(scope="module")
++def live_platform(platform):
++    import uvicorn
++    import os
++    for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
++                "http_proxy", "https_proxy", "all_proxy", "no_proxy"):
++        os.environ.pop(var, None)
++    port = _free_port()
++    base = f"http://127.0.0.1:{port}"
++    config = uvicorn.Config(platform.app, host="127.0.0.1", port=port, log_level="error")
++    server = uvicorn.Server(config)
++    thread = threading.Thread(target=server.run, daemon=True)
++    thread.start()
++    deadline = time.time() + 15
++    while time.time() < deadline:
++        try:
++            if httpx.get(f"{base}/api/public/catalog", timeout=1.0).status_code == 200:
++                break
++        except Exception:
++            time.sleep(0.1)
++    else:
++        raise RuntimeError("platform server did not start")
++    yield base
++    server.should_exit = True
++    thread.join(timeout=5)
++
++
++@pytest.fixture()
++def env(viewer, live_platform, monkeypatch):
++    monkeypatch.setattr(viewer, "PLATFORM_BASE_URL", live_platform)
++    monkeypatch.setenv("PLATFORM_BASE_URL", live_platform)
++    monkeypatch.setenv("MANGA_INTERNAL_TOKEN", "p4-internal-secret")
++    return live_platform
++
++
++@pytest.fixture()
++def vclient(viewer):
++    yield TestClient(viewer.app)
++
++
++def _make_user(platform, username, account_type="author"):
++    import bcrypt as _bcrypt
++    db = platform.SessionLocal()
++    u = platform.User(
++        username=username, email=f"{username}@example.com",
++        hashed_password=_bcrypt.hashpw(b"password123", _bcrypt.gensalt()).decode(),
++        is_active=True, account_type=account_type)
++    db.add(u)
++    db.commit()
++    db.refresh(u)
++    uid = u.id
++    db.close()
++    return uid
++
++
++@pytest.fixture(scope="module")
++def people(platform):
++    return {
++        "author": _make_user(platform, "p4_author"),
++        "reader": _make_user(platform, "p4_reader", "reader"),
++    }
++
++
++def _publish(platform, author_id, title_id, access_level="public", age_restricted=True):
++    d = platform.FINAL_ZIP_DIR / f"user_{author_id}" / f"title_{title_id}"
++    d.mkdir(parents=True, exist_ok=True)
++    meta = {
++        "status": "published", "access_level": access_level,
++        "age_restricted": age_restricted,
++        "title_name": f"作品{title_id}", "episode_name": "第1話",
++        "caption": "", "comment": "", "note": "",
++        "scrambled": False, "tile_size": 16, "webhook_enabled": False,
++        "author_name": "p4_author", "author_id": author_id,
++        "title_id": title_id, "episode_id": 1,
++    }
++    (d / "episode_1_settings.json").write_text(json.dumps(meta, ensure_ascii=False))
++    buf = io.BytesIO()
++    with zipfile.ZipFile(buf, "w") as z:
++        z.writestr("page1.png", PNG_BYTES)
++    (d / "episode_1.cbz").write_bytes(buf.getvalue())
++    thumbs = d / "episode_1_thumbs"
++    thumbs.mkdir(exist_ok=True)
++    (thumbs / "thumb_0000.jpg").write_bytes(JPG_BYTES)
++    return f"/api/public/cbz/{author_id}/{title_id}/1.cbz"
++
++
++def _grant(platform, author_id, title_id, user_id):
++    db = platform.SessionLocal()
++    db.add(platform.Grant(author_id=author_id, title_id=title_id, user_id=user_id))
++    db.commit()
++    db.close()
++
++
++def _ptoken(platform_client, username):
++    r = platform_client.post("/api/auth/token",
++                             data={"username": username, "password": "password123"})
++    assert r.status_code == 200, r.text
++    return r.json()["access_token"]
++
++
++def _auth(token):
++    return {"Authorization": f"Bearer {token}"}
++
++
++def _login(vclient, username):
++    r = vclient.post("/auth/login", data={"username": username, "password": "password123"})
++    assert r.status_code == 200, r.text
++    return r
++
++
++# ---------------------------------------------------------------------------
++# プラットフォーム側：年齢対象の無料作品を閉じる
++# ---------------------------------------------------------------------------
++
++def test_platform_age_gate(platform, platform_client, people):
++    author = people["author"]
++    _publish(platform, author, 401)
++    cbz = f"/api/public/cbz/{author}/401/1.cbz"
++    thumb = f"/api/public/thumb/{author}/401/1/0"
++
++    assert platform_client.get(cbz).status_code == 403
++    assert platform_client.get(thumb).status_code == 403
++
++    # 未申告の読者トークンでも開かない
++    reader_token = _ptoken(platform_client, "p4_reader")
++    assert platform_client.get(cbz, headers=_auth(reader_token)).status_code == 403
++
++    # 作者本人は通る
++    author_token = _ptoken(platform_client, "p4_author")
++    assert platform_client.get(cbz, headers=_auth(author_token)).status_code == 200
++
++    # 申告すれば読者も通る（CBZ・サムネイルとも）
++    platform_client.post("/api/auth/declare-adult", headers=_auth(reader_token))
++    assert platform_client.get(cbz, headers=_auth(reader_token)).status_code == 200
++    assert platform_client.get(thumb, headers=_auth(reader_token)).status_code == 200
++
++
++# ---------------------------------------------------------------------------
++# 閲覧側：匿名のセッション申告ゲート
++# ---------------------------------------------------------------------------
++
++def test_viewer_age_gate_anonymous(platform, env, vclient, people):
++    url = env + _publish(platform, people["author"], 402)
++    r = vclient.get("/session", params={"url": url})
++    assert r.status_code == 403
++    assert "年齢" in r.json()["detail"]
++
++    r = vclient.post("/age/declare")
++    assert r.status_code == 200
++    assert "age_gate" in r.headers.get("set-cookie", "")
++
++    r = vclient.get("/session", params={"url": url})
++    assert r.status_code == 200
++    token = r.json()["session_token"]
++    r = vclient.get("/download/start", params={"url": url, "session_token": token})
++    assert "data: done" in r.text
++    r = vclient.get("/images", params={"url": url, "session_token": token})
++    assert r.status_code == 200
++    assert "page1.png" in r.text
++
++
++# ---------------------------------------------------------------------------
++# 閲覧側：アカウント申告との連携
++# ---------------------------------------------------------------------------
++
++def test_viewer_age_account(platform, env, vclient, people):
++    url = env + _publish(platform, people["author"], 403)
++    # p4_reader はプラットフォーム側テストで申告済みになるため専用ユーザーを使う
++    _make_user(platform, "p4_reader_acct", "reader")
++    _login(vclient, "p4_reader_acct")
++    r = vclient.get("/session", params={"url": url})
++    assert r.status_code == 403
++
++    r = vclient.post("/auth/declare-adult")
++    assert r.status_code == 200, r.text
++
++    r = vclient.get("/session", params={"url": url})
++    assert r.status_code == 200
++    token = r.json()["session_token"]
++    r = vclient.get("/download/start", params={"url": url, "session_token": token})
++    assert "data: done" in r.text
++    r = vclient.get("/images", params={"url": url, "session_token": token})
++    assert r.status_code == 200
++
++
++# ---------------------------------------------------------------------------
++# 複合：premium ＋ 年齢（許可あり・申告なし → 申告で開く）
++# ---------------------------------------------------------------------------
++
++def test_viewer_premium_age_composite(platform, env, vclient, people):
++    import os
++    import manga as mg
++    author = people["author"]
++    url = env + _publish(platform, author, 404, access_level="premium")
++    # p4_reader は他のテストで申告済みになり得るため、複合判定には専用ユーザーを使う
++    rid = _make_user(platform, "p4_reader_age", "reader")
++    _grant(platform, author, 404, rid)
++
++    _login(vclient, "p4_reader_age")
++    r = vclient.get("/session", params={"url": url})
++    assert r.status_code == 200
++    token = r.json()["session_token"]
++    r = vclient.get("/download/start", params={"url": url, "session_token": token})
++    assert "error:" in r.text
++    assert not os.path.exists(mg.get_cache_path(url) + ".cbz")
++
++    # 申告すれば、同じセッションのまま再試行で開く
++    r = vclient.post("/auth/declare-adult")
++    assert r.status_code == 200
++    r = vclient.get("/download/start", params={"url": url, "session_token": token})
++    assert "data: done" in r.text
++    r = vclient.get("/images", params={"url": url, "session_token": token})
++    assert r.status_code == 200
++    assert "page1.png" in r.text
++
++
++# ---------------------------------------------------------------------------
++# リーダーページの年齢バナー
++# ---------------------------------------------------------------------------
++
++def test_reader_page_age_banner(platform, env, vclient, people):
++    url = env + _publish(platform, people["author"], 405)
++    r = vclient.get("/reader", params={"url": url})
++    assert r.status_code == 200
++    assert "年齢対象です" in r.text
++    assert "declareAge" in r.text
++
++    vclient.post("/age/declare")
++    r = vclient.get("/reader", params={"url": url})
++    assert "私は18歳以上です" not in r.text
+diff a/yomima/main.py b/yomima/main.py
+--- a/yomima/main.py	2026-11-06 22:31:26.131624971 +0900
++++ b/yomima/main.py	2026-11-06 22:31:26.196647515 +0900
+@@ -14,6 +14,7 @@
+ import concurrent.futures
+ import time
+ import hashlib
++import secrets
+ import os
+ import httpx
+ from contextlib import asynccontextmanager
+@@ -21,7 +22,7 @@
+ 
+ import urllib.parse
+ from fastapi import FastAPI, Form, HTTPException, Query, Request
+-from fastapi.responses import HTMLResponse, Response, StreamingResponse
++from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+ from fastapi.staticfiles import StaticFiles
+ from fastapi.templating import Jinja2Templates
+ from slowapi import Limiter
+@@ -111,6 +112,202 @@
+ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+     return StarletteResponse("リクエストが多すぎます。しばらく待ってから再試行してください。", status_code=429)
+ 
++
++# ---------------------------------------------------------------------------
++# 読者アカウント（プラットフォームの JWT はサーバー側だけに保持）
++# ---------------------------------------------------------------------------
++AUTH_TTL_SECONDS = 3600  # プラットフォームのトークン有効期限（60分）に合わせる
++_auth_store: dict = {}   # {cookie_token: {platform_token, user_id, username, expires_at}}
++_grants_cache: dict = {} # {user_id: (取得時刻, {(author_id, title_id)})}
++
++
++def _current_reader(request: Request):
++    """ログイン中の読者を返す（未ログイン・期限切れは None）。"""
++    token = request.cookies.get("viewer_auth", "")
++    entry = _auth_store.get(token)
++    if not entry:
++        return None
++    if time.time() > entry["expires_at"]:
++        _auth_store.pop(token, None)
++        return None
++    return entry
++
++
++async def _platform_login(username: str, password: str):
++    """プラットフォームでログインし (platform_token, me) を返す。"""
++    async with httpx.AsyncClient(timeout=10.0) as client:
++        resp = await client.post(
++            f"{PLATFORM_BASE_URL}/api/auth/token",
++            data={"username": username, "password": password},
++        )
++        if resp.status_code != 200:
++            raise HTTPException(status_code=401, detail="ユーザー名またはパスワードが正しくありません")
++        platform_token = resp.json()["access_token"]
++        me_resp = await client.get(
++            f"{PLATFORM_BASE_URL}/api/auth/me",
++            headers={"Authorization": f"Bearer {platform_token}"},
++        )
++        if me_resp.status_code != 200:
++            raise HTTPException(status_code=502, detail="プラットフォームとの通信に失敗しました")
++        return platform_token, me_resp.json()
++
++
++def _start_auth_session(platform_token: str, me: dict) -> JSONResponse:
++    cookie_token = secrets.token_urlsafe(32)
++    _auth_store[cookie_token] = {
++        "platform_token": platform_token,
++        "user_id":        me["id"],
++        "username":       me["username"],
++        "expires_at":     time.time() + AUTH_TTL_SECONDS,
++    }
++    resp = JSONResponse({"username": me["username"]})
++    resp.set_cookie("viewer_auth", cookie_token, max_age=AUTH_TTL_SECONDS,
++                    httponly=True, path="/", samesite="lax")
++    return resp
++
++
++@app.post("/auth/login")
++async def auth_login(username: str = Form(...), password: str = Form(...)):
++    platform_token, me = await _platform_login(username, password)
++    return _start_auth_session(platform_token, me)
++
++
++@app.post("/auth/register")
++async def auth_register(username: str = Form(...), email: str = Form(...),
++                        password: str = Form(...)):
++    async with httpx.AsyncClient(timeout=10.0) as client:
++        resp = await client.post(
++            f"{PLATFORM_BASE_URL}/api/auth/signup",
++            json={"username": username, "email": email, "password": password,
++                  "account_type": "reader"},
++        )
++        if resp.status_code != 200:
++            try:
++                detail = resp.json().get("detail", "登録に失敗しました")
++            except Exception:
++                detail = "登録に失敗しました"
++            raise HTTPException(status_code=400, detail=detail)
++    platform_token, me = await _platform_login(username, password)
++    return _start_auth_session(platform_token, me)
++
++
++@app.post("/auth/logout")
++async def auth_logout(request: Request):
++    _auth_store.pop(request.cookies.get("viewer_auth", ""), None)
++    resp = JSONResponse({"status": "logged_out"})
++    resp.delete_cookie("viewer_auth", path="/")
++    return resp
++
++
++@app.get("/auth/me")
++async def auth_me(request: Request):
++    reader = _current_reader(request)
++    if reader is None:
++        raise HTTPException(status_code=401, detail="ログインしていません")
++    async with httpx.AsyncClient(timeout=10.0) as client:
++        resp = await client.get(
++            f"{PLATFORM_BASE_URL}/api/auth/me",
++            headers={"Authorization": f"Bearer {reader['platform_token']}"},
++        )
++    if resp.status_code == 401:
++        _auth_store.pop(request.cookies.get("viewer_auth", ""), None)
++        raise HTTPException(status_code=401, detail="ログインの有効期限が切れました")
++    if resp.status_code != 200:
++        raise HTTPException(status_code=502, detail="プラットフォームとの通信に失敗しました")
++    return resp.json()
++
++
++async def _fetch_my_grants(reader: dict) -> set:
++    """ログイン中読者に許可が出ている (author_id, title_id) の集合（60秒キャッシュ）。"""
++    now = time.time()
++    cached = _grants_cache.get(reader["user_id"])
++    if cached and now - cached[0] < CATALOG_CACHE_TTL:
++        return cached[1]
++    async with httpx.AsyncClient(timeout=10.0) as client:
++        resp = await client.get(
++            f"{PLATFORM_BASE_URL}/api/auth/grants",
++            headers={"Authorization": f"Bearer {reader['platform_token']}"},
++        )
++        resp.raise_for_status()
++        grants = {(g["author_id"], g["title_id"]) for g in resp.json()}
++    _grants_cache[reader["user_id"]] = (now, grants)
++    return grants
++
++
++def _enforce_session_unlock(request: Request, session: dict) -> None:
++    """許可制セッションは、unlock した読者本人だけが使える。"""
++    uid = session.get("unlock_user_id")
++    if uid is None:
++        return
++    reader = _current_reader(request)
++    if reader is None or reader["user_id"] != uid:
++        raise HTTPException(status_code=403, detail="この作品を読む権限がありません")
++
++
++# ---------------------------------------------------------------------------
++# 年齢確認（無料の年齢対象作品はセッション単位の自己申告ゲート、
++# ログイン中はアカウントの年齢申告と連携する。どちらも自己申告）
++# ---------------------------------------------------------------------------
++AGE_GATE_TTL_SECONDS = 30 * 24 * 3600  # 30日
++_age_gate_store: dict = {}  # {cookie_token: expires_at}
++
++
++def _age_gate_ok(request: Request) -> bool:
++    """匿名読者の年齢ゲート（自己申告）を通過済みか。"""
++    token = request.cookies.get("age_gate", "")
++    exp = _age_gate_store.get(token)
++    if not exp:
++        return False
++    if time.time() > exp:
++        _age_gate_store.pop(token, None)
++        return False
++    return True
++
++
++@app.post("/age/declare")
++@limiter.limit("10/minute")
++async def age_declare(request: Request):
++    """匿名読者の年齢申告（自己申告）。この端末では30日間有効。"""
++    token = secrets.token_urlsafe(32)
++    _age_gate_store[token] = time.time() + AGE_GATE_TTL_SECONDS
++    resp = JSONResponse({"status": "declared"})
++    resp.set_cookie("age_gate", token, max_age=AGE_GATE_TTL_SECONDS,
++                    httponly=True, path="/", samesite="lax")
++    return resp
++
++
++async def _fetch_me(reader: dict):
++    """プラットフォーム上の自分の情報を返す（失敗時は None）。"""
++    try:
++        async with httpx.AsyncClient(timeout=10.0) as client:
++            resp = await client.get(
++                f"{PLATFORM_BASE_URL}/api/auth/me",
++                headers={"Authorization": f"Bearer {reader['platform_token']}"},
++            )
++        return resp.json() if resp.status_code == 200 else None
++    except Exception:
++        return None
++
++
++@app.post("/auth/declare-adult")
++async def auth_declare_adult(request: Request):
++    """ログイン中アカウントの年齢申告をプラットフォームに記録する。"""
++    reader = _current_reader(request)
++    if reader is None:
++        raise HTTPException(status_code=401, detail="ログインしていません")
++    async with httpx.AsyncClient(timeout=10.0) as client:
++        resp = await client.post(
++            f"{PLATFORM_BASE_URL}/api/auth/declare-adult",
++            headers={"Authorization": f"Bearer {reader['platform_token']}"},
++        )
++    if resp.status_code == 401:
++        _auth_store.pop(request.cookies.get("viewer_auth", ""), None)
++        raise HTTPException(status_code=401, detail="ログインの有効期限が切れました")
++    if resp.status_code != 200:
++        raise HTTPException(status_code=502, detail="プラットフォームとの通信に失敗しました")
++    return resp.json()
++
++
+ # ---------------------------------------------------------------------------
+ # List screen  GET /
+ # ---------------------------------------------------------------------------
+@@ -149,11 +346,21 @@
+     except Exception as e:
+         error_msg = f"カタログの取得に失敗しました: {e}"
+ 
++    reader   = _current_reader(request)
++    entitled = set()
++    if reader is not None:
++        try:
++            entitled = await _fetch_my_grants(reader)
++        except Exception:
++            entitled = set()
++
+     return templates.TemplateResponse(request, "public.html", {
+         "request":      request,
+         "catalog":      catalog,
+         "error_msg":    error_msg,
+         "platform_url": PLATFORM_BASE_URL,
++        "entitled":     entitled,
++        "reader_user":  reader,
+     })
+ 
+ # ---------------------------------------------------------------------------
+@@ -177,7 +384,39 @@
+         raise HTTPException(status_code=400, detail=reason)
+ 
+     client_ip = get_client_ip(request)
+-    token     = mg.create_session(url, client_ip)
++
++    # 許可制（premium）のプラットフォーム作品は、ログイン中読者のセッションに
++    # bind する（CBZ 取得にはその読者のトークンを併送し、ページ配信は本人だけ）
++    if "/api/public/cbz/" in url:
++        entry = None
++        try:
++            catalog = await _fetch_platform_catalog(timeout=5.0)
++            entry = next((i for i in catalog if i.get("cbz_url") == url), None)
++        except Exception:
++            entry = None
++        if entry is not None and entry.get("access_level") == "premium":
++            reader = _current_reader(request)
++            if reader is None:
++                raise HTTPException(status_code=401, detail="この作品を読むにはログインが必要です")
++            token = mg.create_session(url, client_ip,
++                                      unlock_user_id=reader["user_id"],
++                                      auth_token=reader["platform_token"])
++            return {"session_token": token, "expires_in": mg.SESSION_TTL_SECONDS}
++        if entry is not None and entry.get("age_restricted"):
++            # 年齢対象の無料作品：ログイン中はアカウント申告、匿名は年齢ゲート
++            reader = _current_reader(request)
++            if reader is not None:
++                me = await _fetch_me(reader)
++                if me is not None and me.get("adult_declared_at"):
++                    token = mg.create_session(url, client_ip, age_verified=True)
++                    return {"session_token": token, "expires_in": mg.SESSION_TTL_SECONDS}
++                raise HTTPException(status_code=403, detail="年齢対象の作品です。先に年齢申告をしてください")
++            if _age_gate_ok(request):
++                token = mg.create_session(url, client_ip, age_verified=True)
++                return {"session_token": token, "expires_in": mg.SESSION_TTL_SECONDS}
++            raise HTTPException(status_code=403, detail="年齢対象の作品です。年齢確認をしてください")
++
++    token = mg.create_session(url, client_ip)
+     return {"session_token": token, "expires_in": mg.SESSION_TTL_SECONDS}
+ 
+ # ---------------------------------------------------------------------------
+@@ -272,6 +511,8 @@
+     # プラットフォーム公開作品（/api/public/cbz/）のみ作者の webhook_enabled 設定に従う。
+     is_platform_url = "/api/public/cbz/" in url
+     webhook_enabled = not is_platform_url   # 外部URL → True、プラットフォーム → カタログ確認後に決定
++    is_premium      = False
++    is_age          = False
+ 
+     try:
+         catalog = await _fetch_platform_catalog(timeout=5.0)
+@@ -282,6 +523,8 @@
+                 # プラットフォーム作品のみ作者設定を反映。外部URLは上書きしない。
+                 if is_platform_url:
+                     webhook_enabled = item.get("webhook_enabled", False)
++                    is_premium      = item.get("access_level") == "premium"
++                    is_age          = bool(item.get("age_restricted"))
+                 t = item.get("title_name", "").strip()
+                 e = item.get("episode_name", "").strip()
+                 if t and e:
+@@ -294,6 +537,12 @@
+     except Exception:
+         pass
+ 
++    reader = _current_reader(request)
++    age_gate_passed = _age_gate_ok(request)
++    if is_age and not age_gate_passed and reader is not None:
++        me = await _fetch_me(reader)
++        age_gate_passed = bool(me and me.get("adult_declared_at"))
++
+     return templates.TemplateResponse(request, "reader.html", {
+         "request":         request,
+         "manga_url":       url,
+@@ -305,6 +554,10 @@
+         "scrambled":       scrambled,
+         "tile_size":       tile_size,
+         "webhook_enabled": webhook_enabled,
++        "is_premium":      is_premium,
++        "is_age_restricted": is_age,
++        "age_gate_passed": age_gate_passed,
++        "reader_logged_in": reader is not None,
+     })
+ 
+ # ---------------------------------------------------------------------------
+@@ -329,6 +582,7 @@
+         raise HTTPException(status_code=403, detail="セッションが無効または期限切れです")
+     if session["cbz_url"] != url:
+         raise HTTPException(status_code=403, detail="セッションのURLが一致しません")
++    _enforce_session_unlock(request, session)
+ 
+     allowed, reason = mg.is_url_fetch_allowed(url)
+     if not allowed:
+@@ -410,6 +664,7 @@
+     expected_hash = hashlib.md5(session["cbz_url"].encode()).hexdigest()
+     if url_hash != expected_hash:
+         raise HTTPException(status_code=403, detail="不正なアクセスです")
++    _enforce_session_unlock(request, session)
+ 
+     path = resolve_extracted_file(url_hash, filename)
+     if path is None or not os.path.exists(path):
+@@ -444,6 +699,7 @@
+     session = mg.validate_session(session_token, get_client_ip(request))
+     if not session or session["cbz_url"] != url:
+         raise HTTPException(status_code=403, detail="セッションが無効です")
++    _enforce_session_unlock(request, session)
+     allowed, reason = mg.is_url_fetch_allowed(url)
+     if not allowed:
+         raise HTTPException(status_code=400, detail=reason)
+@@ -462,7 +718,9 @@
+             loop.call_soon_threadsafe(queue.put_nowait, p)
+ 
+         def run_download():
+-            success, err = mg.download_file(url, archive_path, progress_callback=progress_cb)
++            success, err = mg.download_file(url, archive_path, progress_callback=progress_cb,
++                                            auth_token=session.get("auth_token"),
++                                            age_verified=bool(session.get("age_verified")))
+             if success:
+                 loop.call_soon_threadsafe(queue.put_nowait, "done")
+             else:
+@@ -500,6 +758,7 @@
+     session = mg.validate_session(session_token, get_client_ip(request))
+     if not session or session["cbz_url"] != url:
+         raise HTTPException(status_code=403, detail="セッションが無効です")
++    _enforce_session_unlock(request, session)
+ 
+     # 宛先ポリシー（組み立てる thumb URL は url と同一オリジンなので、これで足りる）
+     allowed, reason = mg.is_url_fetch_allowed(url)
+@@ -536,8 +795,14 @@
+ 
+     if thumb_url:
+         try:
++            headers = _internal_headers()
++            if session.get("auth_token") and "/api/public/thumb/" in thumb_url:
++                # 許可制のサムネイルはプラットフォーム側でも読者トークンが要る
++                headers["Authorization"] = f"Bearer {session['auth_token']}"
++            if session.get("age_verified") and "/api/public/thumb/" in thumb_url:
++                headers["X-Age-Verified"] = "1"
+             async with httpx.AsyncClient(timeout=5.0) as client:
+-                resp = await client.get(thumb_url)
++                resp = await client.get(thumb_url, headers=headers)
+                 if resp.status_code == 200:
+                     return Response(
+                         content=resp.content,
+diff a/yomima/manga.py b/yomima/manga.py
+--- a/yomima/manga.py	2026-11-06 22:31:26.131449187 +0900
++++ b/yomima/manga.py	2026-11-06 22:31:26.196985002 +0900
+@@ -49,8 +49,15 @@
+ # { session_token: { cbz_url, created_at, expires_at, ip, page_count } }
+ _session_store: dict[str, dict] = {}
+ 
+-def create_session(cbz_url: str, client_ip: str) -> str:
+-    """セッショントークンを発行する"""
++def create_session(cbz_url: str, client_ip: str,
++                   unlock_user_id=None, auth_token=None,
++                   age_verified: bool = False) -> str:
++    """セッショントークンを発行する。
++
++    unlock_user_id / auth_token は許可制（premium）作品用：このセッションで
++    ページを返してよい読者のユーザーIDと、CBZ 取得に使うその読者の
++    プラットフォームトークン（サーバー側だけに保持し、ブラウザには渡さない）。
++    """
+     token = secrets.token_urlsafe(32)   # 推測不可能な43文字
+     now   = time.time()
+     _session_store[token] = {
+@@ -59,6 +66,9 @@
+         "expires_at": now + SESSION_TTL_SECONDS,
+         "ip":         client_ip,
+         "page_count": None,   # 初回アクセス時に確定
++        "unlock_user_id": unlock_user_id,
++        "auth_token":     auth_token,
++        "age_verified":   age_verified,
+     }
+     _cleanup_expired_sessions()
+     return token
+@@ -197,6 +207,8 @@
+     save_path: str,
+     max_size_mb: int = MAX_DOWNLOAD_SIZE_MB,
+     progress_callback=None,
++    auth_token: str = None,
++    age_verified: bool = False,
+ ) -> tuple[bool, str]:
+     if os.path.exists(save_path):
+         return True, ""
+@@ -215,6 +227,12 @@
+             headers = {}
+             if internal_token and is_platform_origin(current_url):
+                 headers["X-Internal-Token"] = internal_token
++            if auth_token and is_platform_origin(current_url):
++                # 許可制作品の取得用：読者本人のトークン（プラットフォーム宛てのみ）
++                headers["Authorization"] = f"Bearer {auth_token}"
++            if age_verified and is_platform_origin(current_url):
++                # 年齢ゲート通過済みの取得であることをプラットフォームへ伝える
++                headers["X-Age-Verified"] = "1"
+             response = requests.get(current_url, stream=True, timeout=(10, 60),
+                                     headers=headers, allow_redirects=False)
+             if response.status_code in (301, 302, 303, 307, 308):
+diff a/yomima/templates/base.html b/yomima/templates/base.html
+--- a/yomima/templates/base.html	2026-11-06 22:31:26.129565599 +0900
++++ b/yomima/templates/base.html	2026-11-06 22:31:26.197241797 +0900
+@@ -25,6 +25,20 @@
+         <a href="/"       id="nav-mylist" class="btn btn-sm btn-ghost">📚 マイリスト</a>
+       </nav>
+     </div>
++    <div style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;padding:.45rem 0;font-size:.85rem">
++      <span style="color:#94a3b8">読者アカウント:</span>
++      <span id="auth-state">確認中…</span>
++      <span id="auth-forms" style="display:none;gap:.4rem;align-items:center;flex-wrap:wrap">
++        <input class="input" id="auth-user" type="text" placeholder="ユーザー名" style="width:9rem">
++        <input class="input" id="auth-email" type="email" placeholder="メール（登録時のみ）" style="width:11rem">
++        <input class="input" id="auth-pass" type="password" placeholder="パスワード" style="width:9rem">
++        <button class="btn btn-sm btn-primary" onclick="viewerLogin()">ログイン</button>
++        <button class="btn btn-sm btn-ghost" onclick="viewerRegister()">新規登録</button>
++      </span>
++      <button id="auth-logout" class="btn btn-sm btn-ghost" style="display:none" onclick="viewerLogout()">ログアウト</button>
++      <button id="auth-declare" class="btn btn-sm btn-ghost" style="display:none" onclick="viewerDeclareAdult()">年齢申告（18歳以上）</button>
++      <span id="auth-msg" style="color:#dc2626"></span>
++    </div>
+   </div>
+ </header>
+ 
+@@ -32,5 +46,85 @@
+   {% block content %}{% endblock %}
+ </main>
+ 
++<script>
++function authMsg(text) { document.getElementById('auth-msg').textContent = text || ''; }
++async function refreshAuthArea() {
++  const state = document.getElementById('auth-state');
++  const forms = document.getElementById('auth-forms');
++  const logoutBtn = document.getElementById('auth-logout');
++  const declareBtn = document.getElementById('auth-declare');
++  try {
++    const r = await fetch('/auth/me');
++    if (r.ok) {
++      const me = await r.json();
++      state.textContent = '👤 ' + me.username + ' でログイン中';
++      forms.style.display = 'none';
++      logoutBtn.style.display = '';
++      declareBtn.style.display = '';
++      if (me.adult_declared_at) {
++        declareBtn.textContent = '年齢申告済み';
++        declareBtn.disabled = true;
++      } else {
++        declareBtn.textContent = '年齢申告（18歳以上）';
++        declareBtn.disabled = false;
++      }
++    } else {
++      state.textContent = '未ログイン';
++      forms.style.display = 'inline-flex';
++      logoutBtn.style.display = 'none';
++      declareBtn.style.display = 'none';
++    }
++  } catch(e) {
++    state.textContent = '';
++    forms.style.display = 'inline-flex';
++  }
++}
++async function postAuth(path, fields) {
++  const fd = new FormData();
++  for (const k in fields) fd.append(k, fields[k]);
++  const r = await fetch(path, { method: 'POST', body: fd });
++  const d = await r.json().catch(() => ({}));
++  if (!r.ok) throw new Error(d.detail || '失敗しました');
++  return d;
++}
++async function viewerLogin() {
++  authMsg('');
++  try {
++    await postAuth('/auth/login', {
++      username: document.getElementById('auth-user').value,
++      password: document.getElementById('auth-pass').value,
++    });
++    location.reload();
++  } catch(e) { authMsg(e.message); }
++}
++async function viewerRegister() {
++  authMsg('');
++  const email = document.getElementById('auth-email').value.trim();
++  if (!email) { authMsg('登録にはメールアドレスも入力してください'); return; }
++  try {
++    await postAuth('/auth/register', {
++      username: document.getElementById('auth-user').value,
++      email: email,
++      password: document.getElementById('auth-pass').value,
++    });
++    location.reload();
++  } catch(e) { authMsg(e.message); }
++}
++async function viewerDeclareAdult() {
++  authMsg('');
++  try {
++    const r = await fetch('/auth/declare-adult', { method: 'POST' });
++    const d = await r.json().catch(() => ({}));
++    if (!r.ok) throw new Error(d.detail || '年齢申告に失敗しました');
++    authMsg('年齢申告を記録しました');
++    refreshAuthArea();
++  } catch(e) { authMsg(e.message); }
++}
++async function viewerLogout() {
++  try { await fetch('/auth/logout', { method: 'POST' }); } catch(e) {}
++  location.reload();
++}
++refreshAuthArea();
++</script>
+ </body>
+ </html>
+\ No newline at end of file
+diff a/yomima/templates/public.html b/yomima/templates/public.html
+--- a/yomima/templates/public.html	2026-11-06 22:31:26.130568685 +0900
++++ b/yomima/templates/public.html	2026-11-06 22:31:26.186382520 +0900
+@@ -33,8 +33,13 @@
+           &nbsp;·&nbsp;
+           {% if item.access_level == "public" %}
+             <span style="color:var(--success);">無料</span>
++          {% elif (item.author_id, item.title_id) in entitled %}
++            <span style="color:var(--success);">許可制・読めます</span>
+           {% else %}
+-            <span style="color:var(--accent2);">許可制</span>
++            <span style="color:var(--accent2);">🔒 許可制</span>
++          {% endif %}
++          {% if item.age_restricted %}
++            &nbsp;·&nbsp;<span style="color:#dc2626;font-size:.72rem">🔞 年齢確認</span>
+           {% endif %}
+           {% if item.scrambled %}
+             &nbsp;·&nbsp;<span style="color:#7c3aed;font-size:.72rem">🔒</span>
+diff a/yomima/templates/reader.html b/yomima/templates/reader.html
+--- a/yomima/templates/reader.html	2026-11-06 22:31:26.130450357 +0900
++++ b/yomima/templates/reader.html	2026-11-06 22:31:26.197414947 +0900
+@@ -20,6 +20,9 @@
+   <button class="btn btn-sm btn-ghost" onclick="toggleWh()">⚙ WH</button>
+ </div>
+ 
++{# ── 施錠・案内バナー ── #}
++<div id="lock-msg" style="display:{% if (is_premium and not reader_logged_in) or (is_age_restricted and not age_gate_passed) %}block{% else %}none{% endif %};background:#fef2f2;border:1px solid #fecaca;color:#991b1b;border-radius:6px;padding:.7rem 1rem;margin:.6rem 0;font-size:.9rem">{% if is_premium and not reader_logged_in %}🔒 この作品は許可制です。読むには、上のフォームから読者アカウントでログインしてください（許可は作家から出ます）。{% elif is_age_restricted and not age_gate_passed %}🔞 この作品は年齢対象です。18歳以上の方だけ読めます。 <button class="btn btn-sm btn-primary" onclick="declareAge()">私は18歳以上です</button>{% endif %}</div>
++
+ {# ── Webhookバー（非表示） ── #}
+ <div id="wh-bar">
+   <div class="section-label">Discord Webhook</div>
+@@ -157,11 +160,32 @@
+ /* ================================================================
+    セッション取得
+    ================================================================ */
++const READER_LOGGED_IN = {{ 'true' if reader_logged_in else 'false' }};
++async function declareAge() {
++  try {
++    const path = READER_LOGGED_IN ? '/auth/declare-adult' : '/age/declare';
++    const r = await fetch(path, { method: 'POST' });
++    if (!r.ok) {
++      const d = await r.json().catch(() => ({}));
++      showLock(d.detail || '年齢確認に失敗しました');
++      return;
++    }
++    location.reload();
++  } catch(e) { showLock('年齢確認に失敗しました'); }
++}
++function showLock(msg) {
++  const el = document.getElementById('lock-msg');
++  el.textContent = '🔒 ' + msg;
++  el.style.display = 'block';
++}
+ async function initSession() {
+   try {
+     const r = await fetch(`/session?url=${encodeURIComponent(mangaUrl)}`);
+-    if (r.ok) sessionToken = (await r.json()).session_token || '';
+-  } catch(e) { console.warn('session:', e); }
++    if (r.ok) { sessionToken = (await r.json()).session_token || ''; return true; }
++    const d = await r.json().catch(() => ({}));
++    showLock(d.detail || 'セッションの取得に失敗しました');
++    return false;
++  } catch(e) { console.warn('session:', e); return false; }
+ }
+ 
+ /* ================================================================
+@@ -593,7 +617,7 @@
+ }
+ 
+ async function boot() {
+-  await initSession();
++  if (!await initSession()) return;
+   updateAllBackLinks();  // 初期化時にリンクを設定
+   await init();
+ }

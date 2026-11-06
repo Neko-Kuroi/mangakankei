@@ -20,6 +20,9 @@ html { height: 100%; } /* flexレイアウトに必要 */
   <button class="btn btn-sm btn-ghost" onclick="toggleWh()">⚙ WH</button>
 </div>
 
+{# ── 施錠・案内バナー ── #}
+<div id="lock-msg" style="display:{% if (is_premium and not reader_logged_in) or (is_age_restricted and not age_gate_passed) %}block{% else %}none{% endif %};background:#fef2f2;border:1px solid #fecaca;color:#991b1b;border-radius:6px;padding:.7rem 1rem;margin:.6rem 0;font-size:.9rem">{% if is_premium and not reader_logged_in %}🔒 この作品は許可制です。読むには、上のフォームから読者アカウントでログインしてください（許可は作家から出ます）。{% elif is_age_restricted and not age_gate_passed %}🔞 この作品は年齢対象です。18歳以上の方だけ読めます。 <button class="btn btn-sm btn-primary" onclick="declareAge()">私は18歳以上です</button>{% endif %}</div>
+
 {# ── Webhookバー（非表示） ── #}
 <div id="wh-bar">
   <div class="section-label">Discord Webhook</div>
@@ -157,11 +160,32 @@ const loading = new Set();
 /* ================================================================
    セッション取得
    ================================================================ */
+const READER_LOGGED_IN = {{ 'true' if reader_logged_in else 'false' }};
+async function declareAge() {
+  try {
+    const path = READER_LOGGED_IN ? '/auth/declare-adult' : '/age/declare';
+    const r = await fetch(path, { method: 'POST' });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      showLock(d.detail || '年齢確認に失敗しました');
+      return;
+    }
+    location.reload();
+  } catch(e) { showLock('年齢確認に失敗しました'); }
+}
+function showLock(msg) {
+  const el = document.getElementById('lock-msg');
+  el.textContent = '🔒 ' + msg;
+  el.style.display = 'block';
+}
 async function initSession() {
   try {
     const r = await fetch(`/session?url=${encodeURIComponent(mangaUrl)}`);
-    if (r.ok) sessionToken = (await r.json()).session_token || '';
-  } catch(e) { console.warn('session:', e); }
+    if (r.ok) { sessionToken = (await r.json()).session_token || ''; return true; }
+    const d = await r.json().catch(() => ({}));
+    showLock(d.detail || 'セッションの取得に失敗しました');
+    return false;
+  } catch(e) { console.warn('session:', e); return false; }
 }
 
 /* ================================================================
@@ -593,7 +617,7 @@ async function init() {
 }
 
 async function boot() {
-  await initSession();
+  if (!await initSession()) return;
   updateAllBackLinks();  // 初期化時にリンクを設定
   await init();
 }
