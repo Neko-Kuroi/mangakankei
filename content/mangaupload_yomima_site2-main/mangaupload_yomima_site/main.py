@@ -256,37 +256,6 @@ def scramble_image(img: Image.Image, seed: int, tile_size: int) -> Image.Image:
 
     return scrambled_img
 
-def process_page(
-    raw_path: Path,
-    work_dir: Path,
-    index: int,
-    do_scramble: bool,
-    tile_size: int,
-) -> Path:
-    """
-    1ページ処理:
-      1. リサイズ（DISPLAY_MAX_SIZE以下に収める）
-      2. スクランブル（オプション）
-      3. ランダムファイル名で保存
-    """
-    filename = generate_page_filename(index)
-    save_path = work_dir / filename
-
-    with Image.open(raw_path) as img:
-        img = img.convert("RGB")
-        # アップロード時に一度だけリサイズ
-        img.thumbnail(DISPLAY_MAX_SIZE, Image.LANCZOS)
-
-        if do_scramble:
-            # ファイル名の先頭8文字(prefix除く)がseed
-            seed_hex = filename[4:12]
-            seed     = int(seed_hex, 16)
-            img      = scramble_image(img, seed, tile_size)
-
-        img.save(save_path, "PNG")
-
-    return save_path
-
 def generate_thumbnail(img_path: Path, thumb_dir: Path, index: int) -> Path:
     """サムネイル生成（非スクランブル・小サイズ）"""
     thumb_path = thumb_dir / f"thumb_{index:04d}.jpg"
@@ -391,13 +360,18 @@ app = FastAPI()
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 app.add_middleware(LimitUploadSizeMiddleware)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# CORS: 同梱の画面はすべて同一オリジンで通信するので、既定では無効。
+# 別オリジンのクライアントを許すときだけ、環境変数 MANGA_CORS_ORIGINS に
+# 許可するオリジンをカンマ区切りで指定する（認証は Bearer なので credentials は不要）。
+_cors_origins = [o.strip() for o in os.environ.get("MANGA_CORS_ORIGINS", "").split(",") if o.strip()]
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 @app.exception_handler(RateLimitExceeded)
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded):

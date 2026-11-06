@@ -455,10 +455,6 @@ def load_image_bytes(
     except Exception:
         return None
 
-def get_image_path(url_hash: str, filename: str) -> Optional[str]:
-    path = os.path.join(get_cache_dir(), f"{url_hash}_extracted", filename)
-    return path if os.path.exists(path) else None
-
 # ---------------------------------------------------------------------------
 # Manga list serialization
 # ---------------------------------------------------------------------------
@@ -597,23 +593,6 @@ def build_manga_entry(url: str, title: str = "") -> dict:
         'title':      title or get_filename_from_url(url),
         'added_time': time.time(),
     }
-
-def merge_manga_lists(
-    existing: list[dict],
-    incoming: list[dict],
-    max_count: int = MAX_MANGA_COUNT
-) -> tuple[list[dict], int]:
-    existing_urls = {m['url'] for m in existing}
-    added  = 0
-    result = list(existing)
-    for manga in incoming:
-        if len(result) >= max_count:
-            break
-        if manga['url'] not in existing_urls:
-            result.append(manga)
-            existing_urls.add(manga['url'])
-            added += 1
-    return result, added
 
 # ---------------------------------------------------------------------------
 # Discord Webhook

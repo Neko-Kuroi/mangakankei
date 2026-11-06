@@ -1,0 +1,287 @@
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=storage' '--exclude=instance' a/fileset.py b/fileset.py
+--- a/fileset.py	2026-11-06 17:56:04.593608700 +0900
++++ b/fileset.py	2026-11-06 17:59:31.406524629 +0900
+@@ -13,15 +13,12 @@
+     'setup_app.py'  # File created earlier
+ ]
+ 
+-# Add 'static' and 'storage' if they exist at the root level
+-# Note: The context does not show 'static' or 'storage' directories directly at the root,
+-# but rather '/content/yomima/static/style.css'.
+-# If you meant the 'static' inside 'yomima', adjust the path.
+-# If you intend to create them and then zip, please clarify.
++# Add 'static' if it exists at the root level.
++# 'storage' は実行時データ（パスワードハッシュ入りの DB、アップロード済みの
++# 作品・CBZ、settings.json）なので、配布 zip には絶対に入れない。
++# 存在していても追加しないこと。
+ if os.path.exists('static'):
+     items_to_zip.append('static')
+-if os.path.exists('storage'):
+-    items_to_zip.append('storage')
+ 
+ # Ensure target directories exist before moving (idempotent)
+ os.makedirs('yomima/static', exist_ok=True)
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=storage' '--exclude=instance' a/main.py b/main.py
+--- a/main.py	2026-11-06 17:56:04.597592801 +0900
++++ b/main.py	2026-11-06 17:59:31.408264300 +0900
+@@ -256,37 +256,6 @@
+ 
+     return scrambled_img
+ 
+-def process_page(
+-    raw_path: Path,
+-    work_dir: Path,
+-    index: int,
+-    do_scramble: bool,
+-    tile_size: int,
+-) -> Path:
+-    """
+-    1ページ処理:
+-      1. リサイズ（DISPLAY_MAX_SIZE以下に収める）
+-      2. スクランブル（オプション）
+-      3. ランダムファイル名で保存
+-    """
+-    filename = generate_page_filename(index)
+-    save_path = work_dir / filename
+-
+-    with Image.open(raw_path) as img:
+-        img = img.convert("RGB")
+-        # アップロード時に一度だけリサイズ
+-        img.thumbnail(DISPLAY_MAX_SIZE, Image.LANCZOS)
+-
+-        if do_scramble:
+-            # ファイル名の先頭8文字(prefix除く)がseed
+-            seed_hex = filename[4:12]
+-            seed     = int(seed_hex, 16)
+-            img      = scramble_image(img, seed, tile_size)
+-
+-        img.save(save_path, "PNG")
+-
+-    return save_path
+-
+ def generate_thumbnail(img_path: Path, thumb_dir: Path, index: int) -> Path:
+     """サムネイル生成（非スクランブル・小サイズ）"""
+     thumb_path = thumb_dir / f"thumb_{index:04d}.jpg"
+@@ -391,13 +360,18 @@
+ app.state.limiter = limiter
+ app.add_middleware(SlowAPIMiddleware)
+ app.add_middleware(LimitUploadSizeMiddleware)
+-app.add_middleware(
+-    CORSMiddleware,
+-    allow_origins=["*"],
+-    allow_credentials=True,
+-    allow_methods=["*"],
+-    allow_headers=["*"],
+-)
++# CORS: 同梱の画面はすべて同一オリジンで通信するので、既定では無効。
++# 別オリジンのクライアントを許すときだけ、環境変数 MANGA_CORS_ORIGINS に
++# 許可するオリジンをカンマ区切りで指定する（認証は Bearer なので credentials は不要）。
++_cors_origins = [o.strip() for o in os.environ.get("MANGA_CORS_ORIGINS", "").split(",") if o.strip()]
++if _cors_origins:
++    app.add_middleware(
++        CORSMiddleware,
++        allow_origins=_cors_origins,
++        allow_credentials=False,
++        allow_methods=["*"],
++        allow_headers=["*"],
++    )
+ 
+ @app.exception_handler(RateLimitExceeded)
+ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=storage' '--exclude=instance' a/tests/README.md b/tests/README.md
+--- a/tests/README.md	2026-11-06 17:56:04.597702616 +0900
++++ b/tests/README.md	2026-11-06 17:59:31.407907314 +0900
+@@ -18,3 +18,5 @@
+ - `test_platform_auth.py` — パスワード規則、トークンの sub 形式不正、is_active（問題13-A）
+ - `test_viewer_session_ssrf.py` — セッション必須化、URL 宛先ポリシー、リダイレクト再検証、IP 照合（問題2・4）
+ - `test_internal_token.py` — 内部トークンの送信先制限（前方一致による漏洩の回帰防止）
++- `test_cors.py` — CORS は既定で無効、環境変数 `MANGA_CORS_ORIGINS` を指定したときだけ許可
++- `test_discord_escape.py` — `/discord/send` のエラー文を HTML エスケープする
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=storage' '--exclude=instance' a/tests/test_cors.py b/tests/test_cors.py
+--- a/tests/test_cors.py	1970-01-01 09:00:00.000000000 +0900
++++ b/tests/test_cors.py	2026-11-06 17:59:31.408158361 +0900
+@@ -0,0 +1,58 @@
++"""CORS 設定の検証（プラットフォーム側）。
++
++- 既定では CORS ヘッダーを付けない（同梱の画面は同一オリジンでしか通信しない）
++- 環境変数 MANGA_CORS_ORIGINS を指定したときだけ、そのオリジンを許可する
++- credentials は許可しない（認証は Bearer）
++"""
++import importlib.util
++import sys
++
++import pytest
++from fastapi.testclient import TestClient
++
++ORIGIN = "https://app.example.org"
++
++
++def _load(name, path):
++    spec = importlib.util.spec_from_file_location(name, path)
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[name] = module
++    spec.loader.exec_module(module)
++    return module
++
++
++def _client(site_copy, monkeypatch, origins):
++    if origins is None:
++        monkeypatch.delenv("MANGA_CORS_ORIGINS", raising=False)
++    else:
++        monkeypatch.setenv("MANGA_CORS_ORIGINS", origins)
++    mod = _load(f"platform_cors_{abs(hash(origins))}", site_copy / "main.py")
++    return TestClient(mod.app, raise_server_exceptions=False)
++
++
++def test_no_cors_headers_by_default(platform, site_copy, monkeypatch):
++    client = _client(site_copy, monkeypatch, None)
++    r = client.get("/api/config", headers={"Origin": ORIGIN})
++    assert r.status_code == 200
++    assert "access-control-allow-origin" not in r.headers
++    assert "access-control-allow-credentials" not in r.headers
++
++
++def test_preflight_is_not_granted_by_default(platform, site_copy, monkeypatch):
++    client = _client(site_copy, monkeypatch, None)
++    r = client.options("/api/auth/token", headers={
++        "Origin": ORIGIN, "Access-Control-Request-Method": "POST"})
++    assert "access-control-allow-origin" not in r.headers
++
++
++def test_listed_origin_is_allowed(platform, site_copy, monkeypatch):
++    client = _client(site_copy, monkeypatch, f"{ORIGIN}, https://other.example.org")
++    r = client.get("/api/config", headers={"Origin": ORIGIN})
++    assert r.headers.get("access-control-allow-origin") == ORIGIN
++    assert "access-control-allow-credentials" not in r.headers
++
++
++def test_unlisted_origin_is_not_allowed(platform, site_copy, monkeypatch):
++    client = _client(site_copy, monkeypatch, ORIGIN)
++    r = client.get("/api/config", headers={"Origin": "https://evil.example.net"})
++    assert r.headers.get("access-control-allow-origin") != "https://evil.example.net"
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=storage' '--exclude=instance' a/tests/test_discord_escape.py b/tests/test_discord_escape.py
+--- a/tests/test_discord_escape.py	1970-01-01 09:00:00.000000000 +0900
++++ b/tests/test_discord_escape.py	2026-11-06 17:59:31.408178582 +0900
+@@ -0,0 +1,62 @@
++"""/discord/send のエラー文のエスケープ検証（viewer 側）。
++
++エラー文には例外メッセージ（送信先URLなど入力由来の文字列）が入るので、
++HTML としてそのまま返さない。
++"""
++import hashlib
++
++import pytest
++
++PLAT = "http://localhost:8000/api/public/cbz/1/2/3.cbz"
++PAYLOAD = "<script>alert(1)</script>"
++# 1x1 PNG
++PNG = bytes.fromhex(
++    "89504e470d0a1a0a0000000d4948445200000001000000010806000000"
++    "1f15c4890000000d49444154789c6360000002000001e221bc330000000049454e44ae426082")
++
++
++@pytest.fixture(autouse=True)
++def _reset_limits(viewer):
++    viewer.limiter.reset()
++
++
++@pytest.fixture()
++def session_and_file(viewer_client, manga):
++    r = viewer_client.get("/session", params={"url": PLAT})
++    assert r.status_code == 200
++    import os
++    url_hash = hashlib.md5(PLAT.encode()).hexdigest()
++    folder = os.path.join(manga.get_cache_dir(), f"{url_hash}_extracted")
++    os.makedirs(folder, exist_ok=True)
++    with open(os.path.join(folder, "a.png"), "wb") as f:
++        f.write(PNG)
++    return r.json()["session_token"]
++
++
++def test_error_text_is_html_escaped(viewer_client, manga, session_and_file, monkeypatch):
++    def boom(*args, **kwargs):
++        raise manga.requests.exceptions.ConnectionError(PAYLOAD)
++    monkeypatch.setattr(manga.requests, "post", boom)
++
++    r = viewer_client.post("/discord/send", data={
++        "url": PLAT, "filename": "a.png",
++        "webhook1": "https://discord.com/api/webhooks/1/x",
++        "session_token": session_and_file,
++    })
++    assert r.status_code == 200
++    assert PAYLOAD not in r.text
++    assert "&lt;script&gt;" in r.text
++
++
++def test_multiple_errors_keep_br_separator(viewer_client, manga, session_and_file, monkeypatch):
++    def boom(*args, **kwargs):
++        raise manga.requests.exceptions.ConnectionError("fail")
++    monkeypatch.setattr(manga.requests, "post", boom)
++
++    r = viewer_client.post("/discord/send", data={
++        "url": PLAT, "filename": "a.png",
++        "webhook1": "https://discord.com/api/webhooks/1/x",
++        "webhook2": "https://discord.com/api/webhooks/2/y",
++        "session_token": session_and_file,
++    })
++    assert "<br>" in r.text
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=storage' '--exclude=instance' a/yomima/main.py b/yomima/main.py
+--- a/yomima/main.py	2026-11-06 17:56:04.594633879 +0900
++++ b/yomima/main.py	2026-11-06 17:59:31.407307183 +0900
+@@ -10,6 +10,7 @@
+ """
+ 
+ import asyncio
++import html
+ import concurrent.futures
+ import time
+ import hashlib
+@@ -602,7 +603,9 @@
+ 
+     errors = mg.send_image_to_discord(image_path, webhooks, os.path.basename(image_path))
+     if errors:
+-        return HTMLResponse(f"<span class='status-error'>{'<br>'.join(errors)}</span>")
++        # エラー文には送信先URLや例外メッセージ（入力由来）が入るので、1件ずつエスケープする
++        return HTMLResponse(
++            "<span class='status-error'>" + "<br>".join(html.escape(e) for e in errors) + "</span>")
+     return HTMLResponse("<span class='status-ok'>✓ 送信しました</span>")
+ 
+ # ---------------------------------------------------------------------------
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=storage' '--exclude=instance' a/yomima/manga.py b/yomima/manga.py
+--- a/yomima/manga.py	2026-11-06 17:56:04.596347275 +0900
++++ b/yomima/manga.py	2026-11-06 17:59:31.407372662 +0900
+@@ -455,10 +455,6 @@
+     except Exception:
+         return None
+ 
+-def get_image_path(url_hash: str, filename: str) -> Optional[str]:
+-    path = os.path.join(get_cache_dir(), f"{url_hash}_extracted", filename)
+-    return path if os.path.exists(path) else None
+-
+ # ---------------------------------------------------------------------------
+ # Manga list serialization
+ # ---------------------------------------------------------------------------
+@@ -598,23 +594,6 @@
+         'added_time': time.time(),
+     }
+ 
+-def merge_manga_lists(
+-    existing: list[dict],
+-    incoming: list[dict],
+-    max_count: int = MAX_MANGA_COUNT
+-) -> tuple[list[dict], int]:
+-    existing_urls = {m['url'] for m in existing}
+-    added  = 0
+-    result = list(existing)
+-    for manga in incoming:
+-        if len(result) >= max_count:
+-            break
+-        if manga['url'] not in existing_urls:
+-            result.append(manga)
+-            existing_urls.add(manga['url'])
+-            added += 1
+-    return result, added
+-
+ # ---------------------------------------------------------------------------
+ # Discord Webhook
+ # ---------------------------------------------------------------------------

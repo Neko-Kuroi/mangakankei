@@ -13,15 +13,12 @@ items_to_zip = [
     'setup_app.py'  # File created earlier
 ]
 
-# Add 'static' and 'storage' if they exist at the root level
-# Note: The context does not show 'static' or 'storage' directories directly at the root,
-# but rather '/content/yomima/static/style.css'.
-# If you meant the 'static' inside 'yomima', adjust the path.
-# If you intend to create them and then zip, please clarify.
+# Add 'static' if it exists at the root level.
+# 'storage' は実行時データ（パスワードハッシュ入りの DB、アップロード済みの
+# 作品・CBZ、settings.json）なので、配布 zip には絶対に入れない。
+# 存在していても追加しないこと。
 if os.path.exists('static'):
     items_to_zip.append('static')
-if os.path.exists('storage'):
-    items_to_zip.append('storage')
 
 # Ensure target directories exist before moving (idempotent)
 os.makedirs('yomima/static', exist_ok=True)

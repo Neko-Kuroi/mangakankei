@@ -10,6 +10,7 @@ viewer_main.py - FastAPI router
 """
 
 import asyncio
+import html
 import concurrent.futures
 import time
 import hashlib
@@ -602,7 +603,9 @@ async def discord_send(
 
     errors = mg.send_image_to_discord(image_path, webhooks, os.path.basename(image_path))
     if errors:
-        return HTMLResponse(f"<span class='status-error'>{'<br>'.join(errors)}</span>")
+        # エラー文には送信先URLや例外メッセージ（入力由来）が入るので、1件ずつエスケープする
+        return HTMLResponse(
+            "<span class='status-error'>" + "<br>".join(html.escape(e) for e in errors) + "</span>")
     return HTMLResponse("<span class='status-ok'>✓ 送信しました</span>")
 
 # ---------------------------------------------------------------------------
