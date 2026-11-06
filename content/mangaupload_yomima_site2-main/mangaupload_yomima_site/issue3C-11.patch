@@ -1,0 +1,264 @@
+diff a/setup_app.py b/setup_app.py
+--- a/setup_app.py	2026-11-06 18:12:17.281639608 +0900
++++ b/setup_app.py	2026-11-06 18:18:49.247770170 +0900
+@@ -8,6 +8,7 @@
+ import time
+ import base64
+ import subprocess
++import shutil
+ import threading
+ import sys
+ import re
+@@ -171,6 +172,14 @@
+     os.system('sudo wget -nc https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb')
+     os.system('sudo dpkg -i cloudflared-linux-amd64.deb 2>/dev/null')
+ 
++    # 実行ファイルの場所は導入方法で変わる（deb は /usr/bin、生バイナリは
++    # /usr/local/bin 等）ので、パスを直書きせず PATH から解決する。
++    # 見つからなければ、インストール失敗として明確なエラーで止める。
++    cloudflared_path = shutil.which('cloudflared')
++    if not cloudflared_path:
++        print("❌ cloudflared が見つかりません。インストールに失敗した可能性があります。")
++        return None, None, ""
++
+     # FastAPIアプリケーションをバックグラウンドで起動
+     print("🚀 FastAPI アプリケーションを起動しています...")
+     flask_process = subprocess.Popen(
+@@ -199,7 +208,7 @@
+ 
+     # Cloudflareトンネルの起動
+     print("🌐 Cloudflare トンネルを開始しています...")
+-    tunnel_process = subprocess.Popen(['/usr/local/bin/cloudflared', 'tunnel', '--url', 'http://localhost:8000'],
++    tunnel_process = subprocess.Popen([cloudflared_path, 'tunnel', '--url', 'http://localhost:8000'],
+                                      stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE,
+                                      text=True,
+@@ -265,21 +274,23 @@
+ def wait_for_flask_server(port=8000, timeout=60):
+     """flaskサーバーが起動し、リクエストに応答するのを待機します。"""
+     url = f"http://localhost:{port}"
+-    print(f"Waiting for Go server to start at {url}...")
++    print(f"Waiting for Flask server to start at {url}...")
+     start_time = time.time()
+     while time.time() - start_time < timeout:
+         try:
+             response = requests.get(url, timeout=1)
+             if response.status_code == 200:
+-                print(f"✅ flask server is up and running! Status code: {response.status_code}")
++                print(f"✅ Flask server is up and running! Status code: {response.status_code}")
+                 return True
++            else:
++                print(f"[Health Check] Received status code {response.status_code} for {url}. Waiting...")
+         except requests.exceptions.ConnectionError:
+             pass # サーバーがまだ起動していない、または接続を拒否している
+         except Exception as e:
+-            print(f"Error during flask server health check: {e}")
++            print(f"Error during Flask server health check: {e}")
+             pass
+         time.sleep(1)
+-    print(f"❌ flask server did not respond within {timeout} seconds.")
++    print(f"❌ Flask server did not respond within {timeout} seconds.")
+     return False
+ 
+ 
+diff a/tests/test_discord_escape.py b/tests/test_discord_escape.py
+--- a/tests/test_discord_escape.py	2026-11-06 18:12:17.282490115 +0900
++++ b/tests/test_discord_escape.py	2026-11-06 18:18:49.248451492 +0900
+@@ -21,7 +21,11 @@
+ 
+ 
+ @pytest.fixture()
+-def session_and_file(viewer_client, manga):
++def session_and_file(viewer_client, manga, viewer, monkeypatch):
++    # 問題3Cのサーバー側確認を通すため、この作品は作者が送信を許可していることにする
++    async def fake_catalog(timeout=5.0):
++        return [{"cbz_url": PLAT, "webhook_enabled": True}]
++    monkeypatch.setattr(viewer, "_fetch_platform_catalog", fake_catalog)
+     r = viewer_client.get("/session", params={"url": PLAT})
+     assert r.status_code == 200
+     import os
+diff a/tests/test_discord_permission.py b/tests/test_discord_permission.py
+--- a/tests/test_discord_permission.py	1970-01-01 09:00:00.000000000 +0900
++++ b/tests/test_discord_permission.py	2026-11-06 18:18:49.248492794 +0900
+@@ -0,0 +1,99 @@
++"""問題3C の検証: 作者の webhook_enabled を /discord/send がサーバー側でも確認する。
++
++- プラットフォーム作品で作者が不許可なら、直接叩いても送信されない
++- カタログに無いプラットフォーム作品も不許可（リーダー側の判定と一致）
++- 作者が許可していれば送信できる
++- 外部URLはカタログ確認なしで送信できる
++"""
++import hashlib
++import os
++
++import pytest
++
++PLAT = "http://localhost:8000/api/public/cbz/1/2/3.cbz"
++EXT = "https://example.com/book.cbz"
++PNG = bytes.fromhex(
++    "89504e470d0a1a0a0000000d4948445200000001000000010806000000"
++    "1f15c4890000000d49444154789c6360000002000001e221bc330000000049454e44ae426082")
++
++
++@pytest.fixture(autouse=True)
++def _reset_limits(viewer):
++    viewer.limiter.reset()
++
++
++@pytest.fixture()
++def send_ready(viewer_client, manga):
++    """セッション発行＋展開済みファイルを置き、トークンを返す。"""
++    def _prepare(url):
++        r = viewer_client.get("/session", params={"url": url})
++        assert r.status_code == 200
++        url_hash = hashlib.md5(url.encode()).hexdigest()
++        folder = os.path.join(manga.get_cache_dir(), f"{url_hash}_extracted")
++        os.makedirs(folder, exist_ok=True)
++        with open(os.path.join(folder, "a.png"), "wb") as f:
++            f.write(PNG)
++        return r.json()["session_token"]
++    return _prepare
++
++
++@pytest.fixture()
++def post_calls(manga, monkeypatch):
++    calls = []
++
++    class _Resp:
++        def raise_for_status(self):
++            pass
++
++    def fake_post(url, **kwargs):
++        calls.append(url)
++        return _Resp()
++
++    monkeypatch.setattr(manga.requests, "post", fake_post)
++    return calls
++
++
++def _set_catalog(monkeypatch, viewer, items):
++    async def fake_catalog(timeout=5.0):
++        return items
++    monkeypatch.setattr(viewer, "_fetch_platform_catalog", fake_catalog)
++
++
++def _send(client, url, token):
++    return client.post("/discord/send", data={
++        "url": url, "filename": "a.png",
++        "webhook1": "https://discord.com/api/webhooks/1/x",
++        "session_token": token,
++    })
++
++
++def test_author_disabled_is_rejected(viewer_client, viewer, send_ready, post_calls, monkeypatch):
++    token = send_ready(PLAT)
++    _set_catalog(monkeypatch, viewer, [{"cbz_url": PLAT, "webhook_enabled": False}])
++    r = _send(viewer_client, PLAT, token)
++    assert "許可されていません" in r.text
++    assert post_calls == []
++
++
++def test_platform_work_not_in_catalog_is_rejected(viewer_client, viewer, send_ready, post_calls, monkeypatch):
++    token = send_ready(PLAT)
++    _set_catalog(monkeypatch, viewer, [])
++    r = _send(viewer_client, PLAT, token)
++    assert "許可されていません" in r.text
++    assert post_calls == []
++
++
++def test_author_enabled_sends(viewer_client, viewer, send_ready, post_calls, monkeypatch):
++    token = send_ready(PLAT)
++    _set_catalog(monkeypatch, viewer, [{"cbz_url": PLAT, "webhook_enabled": True}])
++    r = _send(viewer_client, PLAT, token)
++    assert "送信しました" in r.text
++    assert len(post_calls) == 1
++
++
++def test_external_url_needs_no_permission(viewer_client, viewer, send_ready, post_calls, monkeypatch):
++    token = send_ready(EXT)
++    _set_catalog(monkeypatch, viewer, [])
++    r = _send(viewer_client, EXT, token)
++    assert "送信しました" in r.text
++    assert len(post_calls) == 1
+diff a/yomima/main.py b/yomima/main.py
+--- a/yomima/main.py	2026-11-06 18:12:17.281326568 +0900
++++ b/yomima/main.py	2026-11-06 18:18:49.247515167 +0900
+@@ -578,6 +578,23 @@
+ # Discord send  POST /discord/send
+ # ---------------------------------------------------------------------------
+ 
++async def _is_webhook_enabled(url: str) -> bool:
++    """作者の Discord 送信許可をサーバー側でも確認する。
++
++    外部URLは許可。プラットフォーム公開作品はカタログの webhook_enabled に従い、
++    カタログに無い・取得できない場合は不許可（リーダー側の判定と一致させる）。
++    """
++    if "/api/public/cbz/" not in url:
++        return True
++    try:
++        catalog = await _fetch_platform_catalog(timeout=5.0)
++    except Exception:
++        return False
++    for item in catalog:
++        if item.get("cbz_url") == url:
++            return bool(item.get("webhook_enabled", False))
++    return False
++
+ @app.post("/discord/send", response_class=HTMLResponse)
+ async def discord_send(
+     request:  Request,
+@@ -592,6 +609,10 @@
+     if not session or session["cbz_url"] != url:
+         return HTMLResponse("<span class='status-error'>セッションが無効です</span>")
+ 
++    # 作者の送信許可（プラットフォーム作品のみサーバー側でも確認する）
++    if not await _is_webhook_enabled(url):
++        return HTMLResponse("<span class='status-error'>この作品では Discord 送信が許可されていません</span>")
++
+     url_hash   = hashlib.md5(url.encode()).hexdigest()
+     image_path = resolve_extracted_file(url_hash, filename)
+     if image_path is None:
+diff a/yomima/setup_app.py b/yomima/setup_app.py
+--- a/yomima/setup_app.py	2026-11-06 18:12:17.281266247 +0900
++++ b/yomima/setup_app.py	2026-11-06 18:18:49.247476058 +0900
+@@ -8,6 +8,7 @@
+ import time
+ import base64
+ import subprocess
++import shutil
+ import threading
+ import sys
+ import re
+@@ -171,6 +172,14 @@
+     os.system('sudo wget -nc https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb')
+     os.system('sudo dpkg -i cloudflared-linux-amd64.deb 2>/dev/null')
+ 
++    # 実行ファイルの場所は導入方法で変わる（deb は /usr/bin、生バイナリは
++    # /usr/local/bin 等）ので、パスを直書きせず PATH から解決する。
++    # 見つからなければ、インストール失敗として明確なエラーで止める。
++    cloudflared_path = shutil.which('cloudflared')
++    if not cloudflared_path:
++        print("❌ cloudflared が見つかりません。インストールに失敗した可能性があります。")
++        return None, None, ""
++
+     # FastAPIアプリケーションをバックグラウンドで起動
+     print("🚀 FastAPI アプリケーションを起動しています...")
+     flask_process = subprocess.Popen(
+@@ -199,7 +208,7 @@
+ 
+     # Cloudflareトンネルの起動
+     print("🌐 Cloudflare トンネルを開始しています...")
+-    tunnel_process = subprocess.Popen(['/usr/local/bin/cloudflared', 'tunnel', '--url', 'http://localhost:8001'],
++    tunnel_process = subprocess.Popen([cloudflared_path, 'tunnel', '--url', 'http://localhost:8001'],
+                                      stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE,
+                                      text=True,
+@@ -226,7 +235,7 @@
+             if line:
+                 # print(f"Cloudflare Tunnel stderr: {line.strip()}") # デバッグ出力は削除
+                 if 'https://' in line and 'trycloudflare.com' in line:
+-                    match = re.search(r'(https:\/\/[^\s]+\\.trycloudflare\\.com)', line)
++                    match = re.search(r'(https:\/\/[^\s]+\.trycloudflare\.com)', line)
+                     if match:
+                         url = match.group(0).strip()
+                         url_found = True

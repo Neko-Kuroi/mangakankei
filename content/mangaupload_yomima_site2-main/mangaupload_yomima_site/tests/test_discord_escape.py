@@ -21,7 +21,11 @@ def _reset_limits(viewer):
 
 
 @pytest.fixture()
-def session_and_file(viewer_client, manga):
+def session_and_file(viewer_client, manga, viewer, monkeypatch):
+    # 問題3Cのサーバー側確認を通すため、この作品は作者が送信を許可していることにする
+    async def fake_catalog(timeout=5.0):
+        return [{"cbz_url": PLAT, "webhook_enabled": True}]
+    monkeypatch.setattr(viewer, "_fetch_platform_catalog", fake_catalog)
     r = viewer_client.get("/session", params={"url": PLAT})
     assert r.status_code == 200
     import os

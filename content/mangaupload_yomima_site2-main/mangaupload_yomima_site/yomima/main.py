@@ -578,6 +578,23 @@ async def serve_thumbnail(
 # Discord send  POST /discord/send
 # ---------------------------------------------------------------------------
 
+async def _is_webhook_enabled(url: str) -> bool:
+    """作者の Discord 送信許可をサーバー側でも確認する。
+
+    外部URLは許可。プラットフォーム公開作品はカタログの webhook_enabled に従い、
+    カタログに無い・取得できない場合は不許可（リーダー側の判定と一致させる）。
+    """
+    if "/api/public/cbz/" not in url:
+        return True
+    try:
+        catalog = await _fetch_platform_catalog(timeout=5.0)
+    except Exception:
+        return False
+    for item in catalog:
+        if item.get("cbz_url") == url:
+            return bool(item.get("webhook_enabled", False))
+    return False
+
 @app.post("/discord/send", response_class=HTMLResponse)
 async def discord_send(
     request:  Request,
@@ -591,6 +608,10 @@ async def discord_send(
     session = mg.validate_session(session_token, get_client_ip(request))
     if not session or session["cbz_url"] != url:
         return HTMLResponse("<span class='status-error'>セッションが無効です</span>")
+
+    # 作者の送信許可（プラットフォーム作品のみサーバー側でも確認する）
+    if not await _is_webhook_enabled(url):
+        return HTMLResponse("<span class='status-error'>この作品では Discord 送信が許可されていません</span>")
 
     url_hash   = hashlib.md5(url.encode()).hexdigest()
     image_path = resolve_extracted_file(url_hash, filename)

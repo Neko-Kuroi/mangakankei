@@ -8,6 +8,7 @@ import os
 import time
 import base64
 import subprocess
+import shutil
 import threading
 import sys
 import re
@@ -171,6 +172,14 @@ def setup_cloudflare_tunnel():
     os.system('sudo wget -nc https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb')
     os.system('sudo dpkg -i cloudflared-linux-amd64.deb 2>/dev/null')
 
+    # 実行ファイルの場所は導入方法で変わる（deb は /usr/bin、生バイナリは
+    # /usr/local/bin 等）ので、パスを直書きせず PATH から解決する。
+    # 見つからなければ、インストール失敗として明確なエラーで止める。
+    cloudflared_path = shutil.which('cloudflared')
+    if not cloudflared_path:
+        print("❌ cloudflared が見つかりません。インストールに失敗した可能性があります。")
+        return None, None, ""
+
     # FastAPIアプリケーションをバックグラウンドで起動
     print("🚀 FastAPI アプリケーションを起動しています...")
     flask_process = subprocess.Popen(
@@ -199,7 +208,7 @@ def setup_cloudflare_tunnel():
 
     # Cloudflareトンネルの起動
     print("🌐 Cloudflare トンネルを開始しています...")
-    tunnel_process = subprocess.Popen(['/usr/local/bin/cloudflared', 'tunnel', '--url', 'http://localhost:8001'],
+    tunnel_process = subprocess.Popen([cloudflared_path, 'tunnel', '--url', 'http://localhost:8001'],
                                      stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE,
                                      text=True,
@@ -226,7 +235,7 @@ def setup_cloudflare_tunnel():
             if line:
                 # print(f"Cloudflare Tunnel stderr: {line.strip()}") # デバッグ出力は削除
                 if 'https://' in line and 'trycloudflare.com' in line:
-                    match = re.search(r'(https:\/\/[^\s]+\\.trycloudflare\\.com)', line)
+                    match = re.search(r'(https:\/\/[^\s]+\.trycloudflare\.com)', line)
                     if match:
                         url = match.group(0).strip()
                         url_found = True
