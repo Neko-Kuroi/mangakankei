@@ -130,21 +130,27 @@ def get_db() -> Generator[Session, None, None]:
 pwd_context   = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/token")
 
+def user_from_token(token: str, db: Session) -> User:
+    """トークンからユーザーを引く共通処理。
+
+    デコード失敗・sub の形式不正・ユーザー不在・停止中（is_active=False）は
+    すべて 401 にする。手書きデコードの重複をここに集約する。
+    """
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = int(payload.get("sub"))
+    except (JWTError, TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="トークンが無効または期限切れです")
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="ユーザーが見つかりません")
+    return user
+
 def get_current_user(
     token: str = Depends(oauth2_scheme),
     db: Session = Depends(get_db)
 ) -> User:
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id: str = payload.get("sub")
-        if user_id is None:
-            raise HTTPException(status_code=401, detail="認証トークンが無効です")
-    except JWTError:
-        raise HTTPException(status_code=401, detail="トークンの期限切れ、または不正です")
-    user = db.query(User).filter(User.id == int(user_id)).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="ユーザーが見つかりません")
-    return user
+    return user_from_token(token, db)
 
 # ---------------------------------------------------------------------------
 # Pydantic スキーマ
@@ -408,6 +414,10 @@ async def signup(request: Request, user_data: UserRegister, db: Session = Depend
         raise HTTPException(400, "登録済みのメールアドレスです")
     if db.query(User).filter(User.username == user_data.username).first():
         raise HTTPException(400, "使用済みのユーザー名です")
+    if len(user_data.password) < 8:
+        raise HTTPException(400, "パスワードは8文字以上で入力してください")
+    if len(user_data.password.encode("utf-8")) > 72:
+        raise HTTPException(400, "パスワードが長すぎます（72バイトまで）")
     hashed_pw = pwd_context.hash(user_data.password)
     db.add(User(username=user_data.username, email=user_data.email, hashed_password=hashed_pw))
     db.commit()
@@ -422,6 +432,8 @@ async def login(
 ):
     user = db.query(User).filter(User.username == form_data.username).first()
     if not user or not pwd_context.verify(form_data.password, user.hashed_password):
+        raise HTTPException(401, "ユーザー名またはパスワードが正しくありません")
+    if not user.is_active:
         raise HTTPException(401, "ユーザー名またはパスワードが正しくありません")
     access_token = jwt.encode(
         {"sub": str(user.id), "exp": datetime.now(UTC) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)},
@@ -751,14 +763,7 @@ async def preview_cbz(
     token:      str,
     db:         Session = Depends(get_db)
 ):
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id = int(payload.get("sub"))
-    except JWTError:
-        raise HTTPException(status_code=401, detail="トークンが無効または期限切れです")
-
-    if not db.query(User).filter(User.id == user_id).first():
-        raise HTTPException(status_code=401, detail="ユーザーが見つかりません")
+    user_id = user_from_token(token, db).id
 
     cbz_path = FINAL_ZIP_DIR / f"user_{user_id}" / f"title_{title_id}" / f"episode_{episode_id}.cbz"
     if not cbz_path.exists():
@@ -783,11 +788,7 @@ async def author_thumb(
     token:      str,
     db:         Session = Depends(get_db)
 ):
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id = int(payload.get("sub"))
-    except JWTError:
-        raise HTTPException(status_code=401, detail="トークンが無効です")
+    user_id = user_from_token(token, db).id
 
     thumb_path = (
         FINAL_ZIP_DIR / f"user_{user_id}" / f"title_{title_id}"
@@ -810,11 +811,7 @@ async def author_cover(
     token:      str,
     db:         Session = Depends(get_db)
 ):
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id = int(payload.get("sub"))
-    except JWTError:
-        raise HTTPException(status_code=401, detail="トークンが無効です")
+    user_id = user_from_token(token, db).id
 
     cover_path = (
         FINAL_ZIP_DIR / f"user_{user_id}" / f"title_{title_id}"
