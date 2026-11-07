@@ -1,0 +1,683 @@
+diff --git a/README.md b/README.md
+index 1dfb591..ff56b8f 100644
+--- a/README.md
++++ b/README.md
+@@ -5,3 +5,61 @@ Manga upload
+ 
+ - Python 3.11 以上
+ - 依存パッケージ: `pip install -r requirements.txt`
++
++## 設定（環境変数）
++
++プラットフォーム（`main.py`）側:
++
++| 変数 | 内容 |
++|---|---|
++| `MANGA_SECRET_KEY` | JWT の署名鍵。未設定なら `instance/secret_key` を自動生成して使う |
++| `MANGA_ADMIN_USERS` | 管理者のユーザー名（カンマ区切り）。この名前（大文字小文字・全角・空白・ゼロ幅文字だけ違う名前を含む）は一般の登録に使えない。管理者アカウントは `manage.py` で作る |
++| `MANGA_INTERNAL_TOKEN` | 同一マシンの閲覧側との内部通信用の共有トークン（両方に同じ値を設定）。未設定なら内部扱いは無効 |
++| `MANGA_TRUST_CF_HEADER` | `1` のときだけ `CF-Connecting-IP` を接続元 IP として使う（cloudflared の裏で動かす場合のみ） |
++| `MANGA_CORS_ORIGINS` | 別オリジンのクライアントを許すときだけ、許可するオリジンをカンマ区切りで指定。未設定なら CORS は無効 |
++
++閲覧側（`yomima/`）:
++
++| 変数 | 内容 |
++|---|---|
++| `PLATFORM_BASE_URL` | プラットフォームの URL（既定 `http://localhost:8000`） |
++| `MANGA_INTERNAL_TOKEN` | プラットフォームと同じ値 |
++| `MANGA_TRUST_CF_HEADER` | プラットフォームと同じ意味 |
++| `MANGA_CLIENT_KEY_SECRET` | 読者の識別キー（レート制限用）を計算する秘密。未設定なら `instance/client_key_secret` を自動生成する |
++| `MANGA_SESSION_BIND_IP` | `1` のとき、セッショントークンを発行時の IP に結びつける（読者の IP が変わる環境では使わない） |
++| `MANGA_URL_ALLOW_HOSTS` | 宛先の検査（内部アドレスの拒否）を免除するホスト名（カンマ区切り）。内部アドレスの URL を意図的に読むときだけ |
++
++## 管理者アカウント
++
++管理者は `MANGA_ADMIN_USERS` に書いたユーザー名で決まる。この名前は一般の登録で使えない
++（管理者本人より先に同じ名前で登録されて、管理者になられるのを防ぐため）ので、
++アカウントは次のコマンドで作る。サイトのフォルダで実行する（どこから実行しても、
++このフォルダの DB を操作する）。
++
++```bash
++export MANGA_ADMIN_USERS=boss        # サーバーと同じ値
++export ADMIN_PW='（パスワード）'       # 8文字以上・72バイト以下。引数には直接渡さない
++python manage.py create-admin boss --email boss@example.com --password-env ADMIN_PW
++python manage.py list-admins         # アカウントの有無・メールを確認
++```
++
++Colab のノートブックでは、サーバーを起動する前に環境変数を設定する:
++
++```python
++import os, getpass
++os.environ["MANGA_ADMIN_USERS"] = "boss"
++os.environ["ADMIN_PW"] = getpass.getpass("管理者のパスワード: ")
++!python manage.py create-admin boss --email boss@example.com --password-env ADMIN_PW
++```
++
++サーバーの起動時に、管理者名ごとのアカウントの状況（なし／登録済みとそのメール）がログに出る。
++
++**見覚えのないメールで登録済みの場合**（予約の導入前に、第三者が先に登録していた）は、
++`--reset` でパスワードとメールを置き換える。
++
++```bash
++python manage.py create-admin boss --email boss@example.com --password-env ADMIN_PW --reset
++```
++
++先に登録していた人が持つトークンは、最大60分有効なままになる。すぐに無効にするには
++`instance/secret_key` を削除して再起動する（全員が再ログインになる）。
+diff --git a/main.py b/main.py
+index f30556b..cc65bb9 100644
+--- a/main.py
++++ b/main.py
+@@ -10,6 +10,7 @@ import tempfile
+ import secrets
+ import asyncio
+ import threading
++import unicodedata
+ from collections import deque
+ from io import BytesIO
+ from pathlib import Path
+@@ -215,10 +216,50 @@ def get_current_author(current_user: User = Depends(get_current_user)) -> User:
+     return current_user
+ 
+ 
++def admin_names() -> set:
++    """管理者のユーザー名（環境変数 MANGA_ADMIN_USERS、カンマ区切り）。"""
++    return {n.strip() for n in os.environ.get("MANGA_ADMIN_USERS", "").split(",") if n.strip()}
++
++
+ def is_admin(user: User) -> bool:
+-    """管理者は環境変数 MANGA_ADMIN_USERS（ユーザー名のカンマ区切り）で指定する。"""
+-    names = {n.strip() for n in os.environ.get("MANGA_ADMIN_USERS", "").split(",") if n.strip()}
+-    return user.username in names
++    """管理者は環境変数 MANGA_ADMIN_USERS（ユーザー名のカンマ区切り）で指定する。
++    判定は完全一致（表記ゆれは同一視しない）。"""
++    return user.username in admin_names()
++
++
++# ゼロ幅文字（見た目を変えずに名前に紛れ込ませるのに使われる）
++_ZERO_WIDTH_CHARS = "\u200b\u200c\u200d\ufeff"
++
++
++def normalize_username(name: str) -> str:
++    """ユーザー名の表記ゆれを寄せる（予約名の判定専用。管理者判定には使わない）。
++
++    寄せるのは、全角・半角（NFKC）、大文字・小文字、前後の空白、
++    ゼロ幅文字の有無だけ。文字そのものが違う名前（bossy、bo ss 等）は寄せない。
++    """
++    normalized = unicodedata.normalize("NFKC", name)
++    for ch in _ZERO_WIDTH_CHARS:
++        normalized = normalized.replace(ch, "")
++    return normalized.strip().casefold()
++
++
++def is_reserved_username(username: str) -> bool:
++    """管理者名（と表記ゆれだけ違う名前）は一般の登録に使えない。
++
++    管理者より先に同じ名前で登録されると、そのまま管理者になれてしまうため。
++    """
++    target = normalize_username(username)
++    return any(normalize_username(n) == target for n in admin_names())
++
++
++def password_rule_error(password: str) -> Optional[str]:
++    """パスワードの共通規則（signup と manage.py で共用）。
++    問題があれば利用者向けの文言を返し、無ければ None を返す。"""
++    if len(password) < 8:
++        return "パスワードは8文字以上で入力してください"
++    if len(password.encode("utf-8")) > 72:
++        return "パスワードが長すぎます（72バイトまで）"
++    return None
+ 
+ 
+ def get_current_admin(current_user: User = Depends(get_current_user)) -> User:
+@@ -588,6 +629,33 @@ if _cors_origins:
+         allow_headers=["*"],
+     )
+ 
++@app.on_event("startup")
++async def _log_admin_account_status() -> None:
++    """起動時に、管理者名ごとのアカウント状況をログに出す。
++
++    アカウントの作成は manage.py で行う。ここでは確認だけをして、
++    失敗しても起動は妨げない。
++    """
++    try:
++        names = sorted(admin_names())
++        if not names:
++            return
++        db = SessionLocal()
++        try:
++            for name in names:
++                user = db.query(User).filter(User.username == name).first()
++                if user is None:
++                    logger.warning(
++                        "管理者 %s: アカウントなし（manage.py create-admin で作成してください）",
++                        name)
++                else:
++                    logger.info("管理者 %s: 登録済み（email=%s）", name, user.email)
++        finally:
++            db.close()
++    except Exception:
++        logger.exception("管理者アカウントの確認に失敗しました")
++
++
+ @app.exception_handler(RateLimitExceeded)
+ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+     return Response("リクエストが多すぎます。しばらく待ってから再試行してください。", status_code=429)
+@@ -601,14 +669,16 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+ async def signup(request: Request, user_data: UserRegister, db: Session = Depends(get_db)):
+     if db.query(User).filter(User.email == user_data.email).first():
+         raise HTTPException(400, "登録済みのメールアドレスです")
++    # 管理者名は予約済み（文言は重複と同じにして、管理者名かどうかを明かさない）
++    if is_reserved_username(user_data.username):
++        raise HTTPException(400, "使用済みのユーザー名です")
+     if db.query(User).filter(User.username == user_data.username).first():
+         raise HTTPException(400, "使用済みのユーザー名です")
+     if user_data.account_type not in ("author", "reader"):
+         raise HTTPException(400, "アカウント種別が不正です")
+-    if len(user_data.password) < 8:
+-        raise HTTPException(400, "パスワードは8文字以上で入力してください")
+-    if len(user_data.password.encode("utf-8")) > 72:
+-        raise HTTPException(400, "パスワードが長すぎます（72バイトまで）")
++    pw_error = password_rule_error(user_data.password)
++    if pw_error:
++        raise HTTPException(400, pw_error)
+     hashed_pw = _hash_password(user_data.password)
+     db.add(User(username=user_data.username, email=user_data.email,
+                 hashed_password=hashed_pw, account_type=user_data.account_type))
+diff --git a/manage.py b/manage.py
+new file mode 100644
+index 0000000..fd31fc1
+--- /dev/null
++++ b/manage.py
+@@ -0,0 +1,176 @@
++#!/usr/bin/env python3
++"""運用コマンド（管理者アカウントの作成・確認）。
++
++    python manage.py list-admins
++    python manage.py create-admin boss --email boss@example.com --password-env ADMIN_PW
++    python manage.py create-admin boss --email new@example.com --password-env ADMIN_PW --reset
++
++- どこから実行しても、このファイルのあるフォルダの DB（storage/manga_platform.db）を操作する。
++  実行時に「対象DB」として絶対パスを表示する。
++- 管理者名は環境変数 MANGA_ADMIN_USERS（カンマ区切り）で決まる。サーバーと同じ値を設定した
++  状態で実行すること（含まれない名前のアカウントは作らない）。
++- 管理者名は一般の登録では使えない（先取りで管理者になられないため）ので、
++  管理者アカウントの作成経路はこのコマンドだけ。
++- パスワードは引数に直接渡さない（シェル履歴・プロセス一覧に残るため）。
++  --password-env で環境変数名を渡すか、端末なら対話入力（getpass）にする。
++"""
++import argparse
++import getpass
++import os
++import sys
++from pathlib import Path
++from typing import List, Optional
++
++HERE = Path(__file__).resolve().parent
++
++
++class ManageError(Exception):
++    """利用者に伝えるべきエラー（終了コード 1）。"""
++
++
++def _validate_email(email: str) -> str:
++    from email_validator import EmailNotValidError, validate_email
++    try:
++        return validate_email(email, check_deliverability=False).normalized
++    except EmailNotValidError as e:
++        raise ManageError(f"メールアドレスが不正です: {e}")
++
++
++def create_admin(platform, username: str, email: Optional[str], password: str, *,
++                 reset: bool = False, account_type: Optional[str] = None) -> str:
++    """管理者アカウントを作る（reset=True なら既存アカウントのパスワードとメールを置き換える）。"""
++    if username not in platform.admin_names():
++        raise ManageError(
++            f"{username!r} は MANGA_ADMIN_USERS に含まれていません。"
++            "サーバーと同じ値を環境変数に設定してから実行してください。")
++    if account_type not in (None, "author", "reader"):
++        raise ManageError("--type は author か reader を指定してください")
++    pw_error = platform.password_rule_error(password)
++    if pw_error:
++        raise ManageError(pw_error)
++    email = _validate_email(email) if email else None
++
++    User = platform.User
++    db = platform.SessionLocal()
++    try:
++        user = db.query(User).filter(User.username == username).first()
++
++        if user is None:
++            if not email:
++                raise ManageError("新規作成には --email が必要です")
++            holder = db.query(User).filter(User.email == email).first()
++            if holder:
++                raise ManageError(f"メールアドレス {email} は {holder.username!r} が使用中です")
++            user = User(username=username, email=email,
++                        hashed_password=platform._hash_password(password),
++                        account_type=account_type or "author")
++            db.add(user)
++            db.commit()
++            return f"管理者アカウントを作成しました: {username}（email={email}, 種別={user.account_type}）"
++
++        if not reset:
++            raise ManageError(
++                f"{username!r} は既に登録されています（email={user.email}）。"
++                "自分のアカウントなら、そのまま管理者として使えます。"
++                "見覚えのないメールなら、--reset でパスワードとメールを置き換えてください。")
++
++        if email and email != user.email:
++            holder = (db.query(User)
++                      .filter(User.email == email, User.id != user.id).first())
++            if holder:
++                raise ManageError(f"メールアドレス {email} は {holder.username!r} が使用中です")
++            user.email = email
++        user.hashed_password = platform._hash_password(password)
++        user.is_active = True
++        if account_type:
++            user.account_type = account_type
++        db.commit()
++        return f"管理者アカウントを更新しました: {username}（email={user.email}, 種別={user.account_type}）"
++    finally:
++        db.close()
++
++
++def list_admins(platform) -> List[str]:
++    """MANGA_ADMIN_USERS の各名前について、アカウントの状況を1行ずつ返す。"""
++    names = sorted(platform.admin_names())
++    if not names:
++        return ["MANGA_ADMIN_USERS が設定されていません（管理者はいません）"]
++    db = platform.SessionLocal()
++    try:
++        lines = []
++        for name in names:
++            user = db.query(platform.User).filter(platform.User.username == name).first()
++            if user is None:
++                lines.append(f"{name}: アカウントなし")
++            else:
++                lines.append(f"{name}: 登録済み（id={user.id}, email={user.email}, "
++                             f"種別={user.account_type or 'author'}, 有効={bool(user.is_active)}）")
++        return lines
++    finally:
++        db.close()
++
++
++def read_password(password_env: Optional[str]) -> str:
++    if password_env:
++        value = os.environ.get(password_env, "")
++        if not value:
++            raise ManageError(f"環境変数 {password_env} が空か未設定です")
++        return value
++    if not sys.stdin.isatty():
++        raise ManageError(
++            "パスワードは --password-env で渡してください（対話入力は端末でのみ使えます）")
++    first = getpass.getpass("パスワード: ")
++    if first != getpass.getpass("もう一度: "):
++        raise ManageError("パスワードが一致しません")
++    return first
++
++
++def _load_platform():
++    # 本体は ./storage や ./instance を実行時のカレントディレクトリ相対で解決する。
++    # 別のフォルダから import すると、そこに空の DB と別の秘密鍵が作られてしまうので、
++    # 必ずこのファイルのあるフォルダへ移動してから import する。
++    os.chdir(HERE)
++    if str(HERE) not in sys.path:
++        sys.path.insert(0, str(HERE))
++    import main as platform
++    return platform
++
++
++def _build_parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(description="管理者アカウントの作成・確認")
++    sub = parser.add_subparsers(dest="command", required=True)
++
++    sub.add_parser("list-admins", help="MANGA_ADMIN_USERS の各名前のアカウント状況を表示")
++
++    create = sub.add_parser("create-admin", help="管理者アカウントを作成（--reset で置き換え）")
++    create.add_argument("username")
++    create.add_argument("--email", help="新規作成には必須。--reset ではメールを置き換える")
++    create.add_argument("--password-env", metavar="VAR",
++                        help="パスワードを入れた環境変数の名前（省略時は端末で対話入力）")
++    create.add_argument("--reset", action="store_true",
++                        help="既存アカウントのパスワード・メールを置き換え、有効に戻す")
++    create.add_argument("--type", dest="account_type", choices=["author", "reader"],
++                        help="アカウント種別（新規は author が既定。--reset では指定時のみ変更）")
++    return parser
++
++
++def run(argv: Optional[List[str]] = None) -> int:
++    args = _build_parser().parse_args(argv)
++    try:
++        password = read_password(args.password_env) if args.command == "create-admin" else None
++        platform = _load_platform()
++        db_path = (Path.cwd() / (platform.engine.url.database or "")).resolve()
++        print(f"対象DB: {db_path}")
++        if args.command == "list-admins":
++            print("\n".join(list_admins(platform)))
++        else:
++            print(create_admin(platform, args.username, args.email, password,
++                               reset=args.reset, account_type=args.account_type))
++        return 0
++    except ManageError as e:
++        print(f"エラー: {e}", file=sys.stderr)
++        return 1
++
++
++if __name__ == "__main__":
++    sys.exit(run())
+diff --git a/tests/test_admin_reserved.py b/tests/test_admin_reserved.py
+new file mode 100644
+index 0000000..7371ce5
+--- /dev/null
++++ b/tests/test_admin_reserved.py
+@@ -0,0 +1,308 @@
++"""管理者名の先取り対策の検証。
++
++- MANGA_ADMIN_USERS の名前（と、大文字小文字・全角・空白・ゼロ幅文字だけ違う名前）は
++  一般の登録に使えない。拒否の文言は「使用済み」と同じで、管理者名を明かさない
++- 管理者判定（is_admin）は完全一致のまま
++- manage.py（create-admin / list-admins）で管理者アカウントを作れる。
++  どのフォルダから実行しても、サイト側の DB を操作する
++- 起動時に、管理者名ごとのアカウント状況がログに出る（失敗しても起動は妨げない）
++"""
++import importlib.util
++import itertools
++import logging
++import os
++import subprocess
++import sys
++
++import pytest
++from fastapi.testclient import TestClient
++
++TAKEN = "使用済みのユーザー名です"
++_emails = itertools.count(1)
++
++
++@pytest.fixture(autouse=True)
++def _reset_limits(platform):
++    platform.limiter.reset()
++
++
++@pytest.fixture(scope="module")
++def manage(site_copy):
++    spec = importlib.util.spec_from_file_location("manage_mod", site_copy / "manage.py")
++    module = importlib.util.module_from_spec(spec)
++    sys.modules["manage_mod"] = module
++    spec.loader.exec_module(module)
++    return module
++
++
++def signup(client, username, password="password123"):
++    return client.post("/api/auth/signup", json={
++        "username": username,
++        "email": f"reserved{next(_emails)}@example.com",
++        "password": password,
++    })
++
++
++def login(client, username, password="password123"):
++    return client.post("/api/auth/token", data={"username": username, "password": password})
++
++
++def bearer(client, username, password="password123"):
++    r = login(client, username, password)
++    assert r.status_code == 200, r.text
++    return {"Authorization": f"Bearer {r.json()['access_token']}"}
++
++
++# ---------------------------------------------------------------------------
++# 正規化
++# ---------------------------------------------------------------------------
++
++@pytest.mark.parametrize("name", [
++    "boss", "Boss", "BOSS", " boss ", "ｂｏｓｓ", "boss\u200b", "boss\u3000", "bo\u200bss",
++])
++def test_normalize_unifies_variants(platform, name):
++    assert platform.normalize_username(name) == "boss"
++
++
++@pytest.mark.parametrize("name", ["bossy", "b0ss", "bo ss", "bos"])
++def test_normalize_keeps_different_names_apart(platform, name):
++    assert platform.normalize_username(name) != "boss"
++
++
++# ---------------------------------------------------------------------------
++# 登録での予約
++# ---------------------------------------------------------------------------
++
++@pytest.mark.parametrize("name", [
++    "resv", "Resv", "RESV", " resv", "resv ", "ｒｅｓｖ", "resv\u200b", "resv\u3000",
++])
++def test_signup_rejects_reserved_names(platform_client, monkeypatch, name):
++    monkeypatch.setenv("MANGA_ADMIN_USERS", "resv")
++    r = signup(platform_client, name)
++    assert r.status_code == 400
++    assert r.json()["detail"] == TAKEN
++
++
++def test_reserved_message_is_same_as_duplicate(platform_client, monkeypatch):
++    monkeypatch.delenv("MANGA_ADMIN_USERS", raising=False)
++    assert signup(platform_client, "dupname").status_code == 200
++    duplicate = signup(platform_client, "dupname")
++    monkeypatch.setenv("MANGA_ADMIN_USERS", "resv2")
++    reserved = signup(platform_client, "resv2")
++    assert duplicate.status_code == reserved.status_code == 400
++    assert duplicate.json() == reserved.json()
++
++
++def test_other_names_are_not_affected(platform_client, monkeypatch):
++    monkeypatch.setenv("MANGA_ADMIN_USERS", "resv3")
++    assert signup(platform_client, "resv3x").status_code == 200
++    assert signup(platform_client, "xresv3").status_code == 200
++
++
++def test_nothing_is_reserved_without_env(platform_client, monkeypatch):
++    monkeypatch.delenv("MANGA_ADMIN_USERS", raising=False)
++    assert signup(platform_client, "freeadmin").status_code == 200
++
++
++def test_reader_signup_is_also_checked(platform_client, monkeypatch):
++    monkeypatch.setenv("MANGA_ADMIN_USERS", "resv4")
++    r = platform_client.post("/api/auth/signup", json={
++        "username": "RESV4", "email": f"reserved{next(_emails)}@example.com",
++        "password": "password123", "account_type": "reader"})
++    assert r.status_code == 400 and r.json()["detail"] == TAKEN
++
++
++# ---------------------------------------------------------------------------
++# 管理者判定は完全一致のまま
++# ---------------------------------------------------------------------------
++
++def test_is_admin_requires_exact_username(platform_client, make_user, monkeypatch):
++    monkeypatch.setenv("MANGA_ADMIN_USERS", "exact1")
++    make_user("exact1")
++    make_user("Exact1")          # 予約導入前に登録されていた紛らわしい名前、を想定
++    me = platform_client.get("/api/auth/me", headers=bearer(platform_client, "exact1")).json()
++    assert me["is_admin"] is True
++    me = platform_client.get("/api/auth/me", headers=bearer(platform_client, "Exact1")).json()
++    assert me["is_admin"] is False
++
++
++# ---------------------------------------------------------------------------
++# パスワード規則（signup と manage.py で共通）
++# ---------------------------------------------------------------------------
++
++def test_password_rule_boundaries(platform):
++    assert platform.password_rule_error("a" * 7)
++    assert platform.password_rule_error("a" * 8) is None
++    assert platform.password_rule_error("a" * 72) is None
++    assert platform.password_rule_error("a" * 73)
++    assert platform.password_rule_error("あ" * 24) is None      # 72バイト
++    assert platform.password_rule_error("あ" * 25)               # 75バイト
++
++
++# ---------------------------------------------------------------------------
++# manage.py の関数
++# ---------------------------------------------------------------------------
++
++def test_create_admin_makes_a_working_admin(platform, platform_client, manage, make_user, monkeypatch):
++    monkeypatch.setenv("MANGA_ADMIN_USERS", "mgr1")
++    msg = manage.create_admin(platform, "mgr1", "mgr1@example.com", "password123")
++    assert "作成しました" in msg
++    headers = bearer(platform_client, "mgr1")
++    assert platform_client.get("/api/auth/me", headers=headers).json()["is_admin"] is True
++    assert platform_client.get("/api/admin/works", headers=headers).status_code == 200
++    make_user("plain1")
++    assert platform_client.get(
++        "/api/admin/works", headers=bearer(platform_client, "plain1")).status_code == 403
++
++
++def test_create_admin_refuses_existing_account_without_reset(platform, manage, monkeypatch):
++    monkeypatch.setenv("MANGA_ADMIN_USERS", "mgr2")
++    manage.create_admin(platform, "mgr2", "mgr2@example.com", "password123")
++    with pytest.raises(manage.ManageError, match="既に登録されています"):
++        manage.create_admin(platform, "mgr2", "other@example.com", "password456")
++
++
++def test_reset_replaces_password_and_email_and_reactivates(platform, platform_client, manage,
++                                                           make_user, monkeypatch):
++    monkeypatch.setenv("MANGA_ADMIN_USERS", "mgr3")
++    make_user("mgr3", password="oldpassword1", is_active=False)
++    manage.create_admin(platform, "mgr3", "new-mgr3@example.com", "newpassword1", reset=True)
++    assert login(platform_client, "mgr3", "newpassword1").status_code == 200
++    assert login(platform_client, "mgr3", "oldpassword1").status_code == 401
++    db = platform.SessionLocal()
++    user = db.query(platform.User).filter(platform.User.username == "mgr3").first()
++    assert user.email == "new-mgr3@example.com" and user.is_active
++    db.close()
++
++
++def test_create_admin_requires_name_listed_in_env(platform, manage, monkeypatch):
++    monkeypatch.setenv("MANGA_ADMIN_USERS", "someone-else")
++    with pytest.raises(manage.ManageError, match="MANGA_ADMIN_USERS"):
++        manage.create_admin(platform, "mgr4", "mgr4@example.com", "password123")
++    monkeypatch.delenv("MANGA_ADMIN_USERS")
++    with pytest.raises(manage.ManageError, match="MANGA_ADMIN_USERS"):
++        manage.create_admin(platform, "mgr4", "mgr4@example.com", "password123")
++
++
++def test_create_admin_validates_password_email_and_type(platform, manage, monkeypatch):
++    monkeypatch.setenv("MANGA_ADMIN_USERS", "mgr5")
++    with pytest.raises(manage.ManageError, match="8文字以上"):
++        manage.create_admin(platform, "mgr5", "mgr5@example.com", "short")
++    with pytest.raises(manage.ManageError, match="メールアドレスが不正"):
++        manage.create_admin(platform, "mgr5", "not-an-email", "password123")
++    with pytest.raises(manage.ManageError, match="--email"):
++        manage.create_admin(platform, "mgr5", None, "password123")
++    with pytest.raises(manage.ManageError, match="--type"):
++        manage.create_admin(platform, "mgr5", "mgr5@example.com", "password123", account_type="root")
++
++
++def test_create_admin_rejects_email_used_by_someone_else(platform, manage, make_user, monkeypatch):
++    monkeypatch.setenv("MANGA_ADMIN_USERS", "mgr6")
++    make_user("holder")          # holder@example.com
++    with pytest.raises(manage.ManageError, match="holder"):
++        manage.create_admin(platform, "mgr6", "holder@example.com", "password123")
++    manage.create_admin(platform, "mgr6", "mgr6@example.com", "password123")
++    with pytest.raises(manage.ManageError, match="holder"):
++        manage.create_admin(platform, "mgr6", "holder@example.com", "password123", reset=True)
++
++
++def test_reset_keeps_account_type_unless_given(platform, manage, monkeypatch):
++    monkeypatch.setenv("MANGA_ADMIN_USERS", "mgr7")
++    manage.create_admin(platform, "mgr7", "mgr7@example.com", "password123", account_type="reader")
++    manage.create_admin(platform, "mgr7", None, "password456", reset=True)
++    assert "種別=reader" in manage.list_admins(platform)[0]
++    manage.create_admin(platform, "mgr7", None, "password456", reset=True, account_type="author")
++    assert "種別=author" in manage.list_admins(platform)[0]
++
++
++def test_list_admins_reports_each_name(platform, manage, make_user, monkeypatch):
++    make_user("listed1")
++    monkeypatch.setenv("MANGA_ADMIN_USERS", "listed1, listed2")
++    lines = manage.list_admins(platform)
++    assert any(l.startswith("listed1: 登録済み") and "listed1@example.com" in l for l in lines)
++    assert "listed2: アカウントなし" in lines
++    monkeypatch.delenv("MANGA_ADMIN_USERS")
++    assert "設定されていません" in manage.list_admins(platform)[0]
++
++
++# ---------------------------------------------------------------------------
++# コマンドとして実行（別のフォルダから）
++# ---------------------------------------------------------------------------
++
++def _run_cli(site_copy, cwd, args, env_extra):
++    env = {**os.environ, **env_extra}
++    return subprocess.run(
++        [sys.executable, str(site_copy / "manage.py"), *args],
++        cwd=cwd, env=env, capture_output=True, text=True,
++        stdin=subprocess.DEVNULL, timeout=120)
++
++
++def test_cli_works_from_another_directory(platform, site_copy, tmp_path):
++    r = _run_cli(site_copy, tmp_path,
++                 ["create-admin", "cliadm", "--email", "cliadm@example.com", "--password-env", "CLI_PW"],
++                 {"MANGA_ADMIN_USERS": "cliadm", "CLI_PW": "password123"})
++    assert r.returncode == 0, r.stderr
++    assert "作成しました" in r.stdout
++    assert str(site_copy) in r.stdout                       # 対象DBはサイト側
++    assert list(tmp_path.iterdir()) == []                   # 実行したフォルダに DB や鍵を作らない
++    db = platform.SessionLocal()
++    assert db.query(platform.User).filter(platform.User.username == "cliadm").first() is not None
++    db.close()
++
++    r = _run_cli(site_copy, tmp_path, ["list-admins"], {"MANGA_ADMIN_USERS": "cliadm,cliadm2"})
++    assert r.returncode == 0
++    assert "cliadm: 登録済み" in r.stdout and "cliadm2: アカウントなし" in r.stdout
++
++
++def test_cli_reports_errors_with_exit_code_1(site_copy, tmp_path):
++    r = _run_cli(site_copy, tmp_path,
++                 ["create-admin", "cliadm3", "--email", "c3@example.com", "--password-env", "CLI_PW"],
++                 {"MANGA_ADMIN_USERS": "other", "CLI_PW": "password123"})
++    assert r.returncode == 1 and "MANGA_ADMIN_USERS" in r.stderr
++
++    r = _run_cli(site_copy, tmp_path,
++                 ["create-admin", "cliadm3", "--email", "c3@example.com"],
++                 {"MANGA_ADMIN_USERS": "cliadm3"})
++    assert r.returncode == 1 and "--password-env" in r.stderr
++
++    r = _run_cli(site_copy, tmp_path,
++                 ["create-admin", "cliadm3", "--email", "c3@example.com", "--password-env", "NOPE_PW"],
++                 {"MANGA_ADMIN_USERS": "cliadm3"})
++    assert r.returncode == 1 and "NOPE_PW" in r.stderr
++
++
++# ---------------------------------------------------------------------------
++# 起動時のログ
++# ---------------------------------------------------------------------------
++
++def test_startup_logs_admin_account_status(platform, make_user, monkeypatch, caplog):
++    make_user("logadm_present")
++    monkeypatch.setenv("MANGA_ADMIN_USERS", "logadm_missing,logadm_present")
++    caplog.set_level(logging.INFO)
++    with TestClient(platform.app):
++        pass
++    text = "\n".join(r.getMessage() for r in caplog.records)
++    assert "logadm_missing" in text and "アカウントなし" in text
++    assert "logadm_present" in text and "登録済み" in text and "logadm_present@example.com" in text
++    missing = [r for r in caplog.records if "logadm_missing" in r.getMessage()]
++    assert missing and missing[0].levelno == logging.WARNING
++
++
++def test_startup_log_failure_does_not_block_startup(platform, monkeypatch, caplog):
++    monkeypatch.setenv("MANGA_ADMIN_USERS", "logadm_x")
++
++    def boom():
++        raise RuntimeError("db down")
++    monkeypatch.setattr(platform, "SessionLocal", boom)
++    caplog.set_level(logging.INFO)
++    with TestClient(platform.app) as client:
++        assert client.get("/").status_code == 200
++    assert "管理者アカウントの確認に失敗" in "\n".join(r.getMessage() for r in caplog.records)
++
++
++def test_startup_is_silent_without_admin_users(platform, monkeypatch, caplog):
++    monkeypatch.delenv("MANGA_ADMIN_USERS", raising=False)
++    caplog.set_level(logging.INFO)
++    with TestClient(platform.app):
++        pass
++    assert not [r for r in caplog.records if "管理者" in r.getMessage()]
