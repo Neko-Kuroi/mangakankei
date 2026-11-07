@@ -1,0 +1,69 @@
+diff --git a/main.py b/main.py
+index cc65bb9..2c14ca5 100644
+--- a/main.py
++++ b/main.py
+@@ -12,6 +12,7 @@ import asyncio
+ import threading
+ import unicodedata
+ from collections import deque
++from contextlib import asynccontextmanager
+ from io import BytesIO
+ from pathlib import Path
+ from datetime import datetime, timedelta, UTC
+@@ -612,25 +613,7 @@ class LimitUploadSizeMiddleware(BaseHTTPMiddleware):
+ # ---------------------------------------------------------------------------
+ # FastAPI アプリ
+ # ---------------------------------------------------------------------------
+-app = FastAPI()
+-app.state.limiter = limiter
+-app.add_middleware(SlowAPIMiddleware)
+-app.add_middleware(LimitUploadSizeMiddleware)
+-# CORS: 同梱の画面はすべて同一オリジンで通信するので、既定では無効。
+-# 別オリジンのクライアントを許すときだけ、環境変数 MANGA_CORS_ORIGINS に
+-# 許可するオリジンをカンマ区切りで指定する（認証は Bearer なので credentials は不要）。
+-_cors_origins = [o.strip() for o in os.environ.get("MANGA_CORS_ORIGINS", "").split(",") if o.strip()]
+-if _cors_origins:
+-    app.add_middleware(
+-        CORSMiddleware,
+-        allow_origins=_cors_origins,
+-        allow_credentials=False,
+-        allow_methods=["*"],
+-        allow_headers=["*"],
+-    )
+-
+-@app.on_event("startup")
+-async def _log_admin_account_status() -> None:
++def _log_admin_account_status() -> None:
+     """起動時に、管理者名ごとのアカウント状況をログに出す。
+ 
+     アカウントの作成は manage.py で行う。ここでは確認だけをして、
+@@ -656,6 +639,29 @@ async def _log_admin_account_status() -> None:
+         logger.exception("管理者アカウントの確認に失敗しました")
+ 
+ 
++@asynccontextmanager
++async def _lifespan(app: FastAPI):
++    _log_admin_account_status()
++    yield
++
++
++app = FastAPI(lifespan=_lifespan)
++app.state.limiter = limiter
++app.add_middleware(SlowAPIMiddleware)
++app.add_middleware(LimitUploadSizeMiddleware)
++# CORS: 同梱の画面はすべて同一オリジンで通信するので、既定では無効。
++# 別オリジンのクライアントを許すときだけ、環境変数 MANGA_CORS_ORIGINS に
++# 許可するオリジンをカンマ区切りで指定する（認証は Bearer なので credentials は不要）。
++_cors_origins = [o.strip() for o in os.environ.get("MANGA_CORS_ORIGINS", "").split(",") if o.strip()]
++if _cors_origins:
++    app.add_middleware(
++        CORSMiddleware,
++        allow_origins=_cors_origins,
++        allow_credentials=False,
++        allow_methods=["*"],
++        allow_headers=["*"],
++    )
++
+ @app.exception_handler(RateLimitExceeded)
+ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+     return Response("リクエストが多すぎます。しばらく待ってから再試行してください。", status_code=429)
