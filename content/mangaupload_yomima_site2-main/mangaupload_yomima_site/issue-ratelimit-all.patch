@@ -1,0 +1,765 @@
+--- a/main.py
++++ b/main.py
+@@ -10,6 +10,7 @@
+ import secrets
+ import asyncio
+ import threading
++from collections import deque
+ from io import BytesIO
+ from pathlib import Path
+ from datetime import datetime, timedelta, UTC
+@@ -477,8 +478,68 @@
+ # レート制限
+ # ---------------------------------------------------------------------------
+ def get_ip_for_limit(request: Request) -> str:
++    """レート制限のキー。
++
++    閲覧側経由の認証では、閲覧側が読者の実IPから計算した不透明な
++    クライアントキー（X-Viewer-Client-Key）をキーに使うことで、
++    全読者が閲覧側サーバーの IP 枠を分け合わないようにする。
++    生IPはプラットフォームに届かない。ヘッダを信頼するのは内部
++    リクエスト（localhost＋内部トークン一致）のときだけ。
++    """
++    if _is_internal_request(request):
++        key = request.headers.get("X-Viewer-Client-Key", "")
++        if re.fullmatch(r"[0-9a-f]{64}", key):
++            return "viewer:" + key
+     return get_client_ip(request)
+ 
++
++# ---------------------------------------------------------------------------
++# ログインのユーザー名単位カウンタ（IP/クライアントキー単位と併用）
++#
++# slowapi の key_func は非同期関数に対応しておらず（コルーチンがそのまま
++# キー文字列化されて枠が貯まらないことを実測で確認）、フォームの
++# ユーザー名をキーにできないため、ハンドラ側で失敗回数を数える。
++# 送信元を変えても、閲覧側の秘密の差し替えでクライアントキーが全交換
++# されても、同一アカウントへの失敗は数え続けられる。成功でリセット。
++# ---------------------------------------------------------------------------
++_LOGIN_USER_LIMIT = 5
++_LOGIN_USER_WINDOW = 60.0
++_login_failures: dict = {}
++_login_failures_lock = threading.Lock()
++
++
++def _login_user_blocked(username: str) -> bool:
++    """直近ウィンドウ内の失敗が上限に達していれば True。"""
++    now = time.monotonic()
++    with _login_failures_lock:
++        q = _login_failures.get(username)
++        if not q:
++            return False
++        cutoff = now - _LOGIN_USER_WINDOW
++        while q and q[0] < cutoff:
++            q.popleft()
++        return len(q) >= _LOGIN_USER_LIMIT
++
++
++def _record_login_failure(username: str) -> None:
++    now = time.monotonic()
++    with _login_failures_lock:
++        q = _login_failures.setdefault(username, deque())
++        cutoff = now - _LOGIN_USER_WINDOW
++        while q and q[0] < cutoff:
++            q.popleft()
++        q.append(now)
++        if len(_login_failures) > 4096:
++            stale = [n for n, dq in _login_failures.items()
++                     if not dq or dq[-1] < cutoff]
++            for n in stale:
++                _login_failures.pop(n, None)
++
++
++def _clear_login_failures(username: str) -> None:
++    with _login_failures_lock:
++        _login_failures.pop(username, None)
++
+ def _is_internal_request(request: Request) -> bool:
+     """同一マシン上の内部クライアント（閲覧側など）からのリクエストかどうか。
+ 
+@@ -561,11 +622,16 @@
+     form_data: OAuth2PasswordRequestForm = Depends(),
+     db: Session = Depends(get_db)
+ ):
++    if _login_user_blocked(form_data.username):
++        raise HTTPException(429, "リクエストが多すぎます。しばらく待ってから再試行してください。")
+     user = db.query(User).filter(User.username == form_data.username).first()
+     if not user or not _verify_password(form_data.password, user.hashed_password):
++        _record_login_failure(form_data.username)
+         raise HTTPException(401, "ユーザー名またはパスワードが正しくありません")
+     if not user.is_active:
++        _record_login_failure(form_data.username)
+         raise HTTPException(401, "ユーザー名またはパスワードが正しくありません")
++    _clear_login_failures(form_data.username)
+     access_token = jwt.encode(
+         {"sub": str(user.id), "exp": datetime.now(UTC) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)},
+         SECRET_KEY, algorithm=ALGORITHM
+--- a/yomima/main.py
++++ b/yomima/main.py
+@@ -14,6 +14,7 @@
+ import concurrent.futures
+ import time
+ import hashlib
++import hmac
+ import secrets
+ import os
+ import httpx
+@@ -85,6 +86,76 @@
+             return cf_ip
+     return request.client.host if request.client else "unknown"
+ 
++
++# ---------------------------------------------------------------------------
++# クライアントキー（プラットフォームのレート制限を読者ごとに分ける）
++# ---------------------------------------------------------------------------
++_client_key_secret_cache: Optional[str] = None
++
++
++def _client_key_secret_file() -> str:
++    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
++                        "instance", "client_key_secret")
++
++
++def _client_key_secret() -> str:
++    """クライアントキー計算用の秘密。
++
++    解決順: 環境変数 MANGA_CLIENT_KEY_SECRET ＞ instance/client_key_secret
++    ファイル ＞ 初回に生成して同ファイルへ保存（0600）。
++    秘密は閲覧側だけが持ち、プラットフォームには渡らない。
++    用意できなければ空文字を返し、その場合はキー自体を付けない
++    （プラットフォーム側は従来どおり閲覧側IPで数える）。
++    """
++    global _client_key_secret_cache
++    if _client_key_secret_cache is not None:
++        return _client_key_secret_cache
++    env = os.environ.get("MANGA_CLIENT_KEY_SECRET", "")
++    if env:
++        _client_key_secret_cache = env
++        return env
++    path = _client_key_secret_file()
++    try:
++        if os.path.exists(path):
++            with open(path) as f:
++                value = f.read().strip()
++            _client_key_secret_cache = value
++            return value
++        os.makedirs(os.path.dirname(path), exist_ok=True)
++        value = secrets.token_hex(32)
++        tmp = path + ".tmp"
++        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
++        with os.fdopen(fd, "w") as f:
++            f.write(value)
++        os.replace(tmp, path)
++        _client_key_secret_cache = value
++        return value
++    except OSError:
++        _client_key_secret_cache = ""
++        return ""
++
++
++def _client_key_for(request: Request) -> str:
++    """読者の実IPから不透明なクライアントキーを計算する（HMAC-SHA256 hex）。
++
++    生IPはプラットフォームに送らない。秘密が無ければ空文字。
++    """
++    sec = _client_key_secret()
++    if not sec:
++        return ""
++    return hmac.new(sec.encode("utf-8"),
++                    get_client_ip(request).encode("utf-8"),
++                    hashlib.sha256).hexdigest()
++
++
++def _auth_proxy_headers(request: Request) -> dict:
++    """プラットフォームの認証系への代理送信用ヘッダ（内部トークン＋クライアントキー）。"""
++    headers = _internal_headers()
++    key = _client_key_for(request)
++    if key:
++        headers["X-Viewer-Client-Key"] = key
++    return headers
++
+ # ---------------------------------------------------------------------------
+ # レート制限
+ # ---------------------------------------------------------------------------
+@@ -117,6 +188,7 @@
+ # 読者アカウント（プラットフォームの JWT はサーバー側だけに保持）
+ # ---------------------------------------------------------------------------
+ AUTH_TTL_SECONDS = 3600  # プラットフォームのトークン有効期限（60分）に合わせる
++_RATE_LIMIT_MESSAGE = "混み合っています。少し待ってから再試行してください"
+ _auth_store: dict = {}   # {cookie_token: {platform_token, user_id, username, expires_at}}
+ _grants_cache: dict = {} # {user_id: (取得時刻, {(author_id, title_id)})}
+ 
+@@ -133,13 +205,18 @@
+     return entry
+ 
+ 
+-async def _platform_login(username: str, password: str):
++async def _platform_login(username: str, password: str,
++                          request: Optional[Request] = None):
+     """プラットフォームでログインし (platform_token, me) を返す。"""
++    headers = _auth_proxy_headers(request) if request is not None else {}
+     async with httpx.AsyncClient(timeout=10.0) as client:
+         resp = await client.post(
+             f"{PLATFORM_BASE_URL}/api/auth/token",
+             data={"username": username, "password": password},
++            headers=headers,
+         )
++        if resp.status_code == 429:
++            raise HTTPException(status_code=429, detail=_RATE_LIMIT_MESSAGE)
+         if resp.status_code != 200:
+             raise HTTPException(status_code=401, detail="ユーザー名またはパスワードが正しくありません")
+         platform_token = resp.json()["access_token"]
+@@ -167,27 +244,31 @@
+ 
+ 
+ @app.post("/auth/login")
+-async def auth_login(username: str = Form(...), password: str = Form(...)):
+-    platform_token, me = await _platform_login(username, password)
++async def auth_login(request: Request, username: str = Form(...),
++                     password: str = Form(...)):
++    platform_token, me = await _platform_login(username, password, request)
+     return _start_auth_session(platform_token, me)
+ 
+ 
+ @app.post("/auth/register")
+-async def auth_register(username: str = Form(...), email: str = Form(...),
+-                        password: str = Form(...)):
++async def auth_register(request: Request, username: str = Form(...),
++                        email: str = Form(...), password: str = Form(...)):
+     async with httpx.AsyncClient(timeout=10.0) as client:
+         resp = await client.post(
+             f"{PLATFORM_BASE_URL}/api/auth/signup",
+             json={"username": username, "email": email, "password": password,
+                   "account_type": "reader"},
++            headers=_auth_proxy_headers(request),
+         )
++        if resp.status_code == 429:
++            raise HTTPException(status_code=429, detail=_RATE_LIMIT_MESSAGE)
+         if resp.status_code != 200:
+             try:
+                 detail = resp.json().get("detail", "登録に失敗しました")
+             except Exception:
+                 detail = "登録に失敗しました"
+             raise HTTPException(status_code=400, detail=detail)
+-    platform_token, me = await _platform_login(username, password)
++    platform_token, me = await _platform_login(username, password, request)
+     return _start_auth_session(platform_token, me)
+ 
+ 
+--- a/tests/test_ratelimit_key.py
++++ b/tests/test_ratelimit_key.py
+@@ -0,0 +1,232 @@
++"""段階1（レート制限キーの分離）の検証。
++
++閲覧側経由の認証が全読者でプラットフォームの IP 枠を分け合う問題への対処:
++- 内部リクエスト（localhost＋内部トークン）のときだけ、閲覧側が付けた
++  不透明なクライアントキー（X-Viewer-Client-Key、HMAC hex 64文字）を
++  レート制限のキーにする。生IPはプラットフォームに届かない。
++- 閲覧側はキーを読者の実IPから HMAC-SHA256 で計算し、秘密は閲覧側だけが持つ。
++"""
++import hashlib
++import hmac
++import os
++import stat
++
++import pytest
++from fastapi.testclient import TestClient
++from starlette.requests import Request
++
++TOKEN = "ratelimit-test-token"
++KEY_A = "a" * 64
++KEY_B = "b" * 64
++
++
++@pytest.fixture(autouse=True)
++def _env(platform, monkeypatch):
++    monkeypatch.setenv("MANGA_INTERNAL_TOKEN", TOKEN)
++    platform.limiter.reset()
++    platform._login_failures.clear()
++    yield
++    platform.limiter.reset()
++    platform._login_failures.clear()
++
++
++class _LocalhostApp:
++    """ASGI ラッパ: 接続元を 127.0.0.1 に見せる（TestClient の既定は testclient で
++    内部判定を通らないため。実運用の同一マシン構成を再現する）。"""
++
++    def __init__(self, app):
++        self.app = app
++
++    async def __call__(self, scope, receive, send):
++        if scope.get("type") == "http":
++            scope = dict(scope, client=("127.0.0.1", 50000))
++        await self.app(scope, receive, send)
++
++
++@pytest.fixture()
++def internal_client(platform):
++    return TestClient(_LocalhostApp(platform.app),
++                      raise_server_exceptions=False)
++
++
++def _internal(key=None):
++    headers = {"X-Internal-Token": TOKEN}
++    if key:
++        headers["X-Viewer-Client-Key"] = key
++    return headers
++
++
++def _signup(client, n, headers):
++    return client.post("/api/auth/signup", json={
++        "username": f"rk_{n}", "email": f"rk_{n}@example.com",
++        "password": "password123", "account_type": "reader",
++    }, headers=headers)
++
++
++# ---------------------------------------------------------------------------
++# プラットフォーム側: 枠の分離
++# ---------------------------------------------------------------------------
++
++def test_signup_buckets_separated_by_key(internal_client):
++    for i in range(3):
++        assert _signup(internal_client, f"a{i}", _internal(KEY_A)).status_code == 200
++    # 同じキーの4人目は詰まる
++    assert _signup(internal_client, "a3", _internal(KEY_A)).status_code == 429
++    # 違うキーなら別の枠で通る
++    assert _signup(internal_client, "b0", _internal(KEY_B)).status_code == 200
++
++
++def test_signup_shared_bucket_without_key(internal_client):
++    for i in range(3):
++        assert _signup(internal_client, f"n{i}", _internal()).status_code == 200
++    assert _signup(internal_client, "n3", _internal()).status_code == 429
++
++
++def test_key_header_without_token_is_ignored(platform_client):
++    # 内部トークンが無ければクライアントキーは信頼されない（偽装で枠を逃げられない）
++    for i in range(3):
++        r = _signup(platform_client, f"f{i}", {"X-Viewer-Client-Key": KEY_A})
++        assert r.status_code == 200
++    r = _signup(platform_client, "f3", {"X-Viewer-Client-Key": KEY_B})
++    assert r.status_code == 429
++
++
++def test_malformed_key_is_ignored(internal_client):
++    bad = _internal("not-a-valid-key")
++    for i in range(3):
++        assert _signup(internal_client, f"m{i}", bad).status_code == 200
++    assert _signup(internal_client, "m3", bad).status_code == 429
++
++
++def test_login_buckets_separated_by_key(internal_client, make_user):
++    make_user("rk_login")
++    make_user("rk_login_other")
++    for _ in range(5):
++        r = internal_client.post(
++            "/api/auth/token",
++            data={"username": "rk_login", "password": "wrong-password"},
++            headers=_internal(KEY_A))
++        assert r.status_code == 401
++    # 同じキーでは正しい資格情報でも詰まる
++    r = internal_client.post(
++        "/api/auth/token",
++        data={"username": "rk_login", "password": "password123"},
++        headers=_internal(KEY_A))
++    assert r.status_code == 429
++    # 違うキー・違うユーザー（別の読者）なら巻き込まれない
++    # （同一ユーザーがキーだけ変えた場合は段階2のユーザー名枠で止まる。
++    #  そちらは test_ratelimit_key2.py で検証する）
++    r = internal_client.post(
++        "/api/auth/token",
++        data={"username": "rk_login_other", "password": "password123"},
++        headers=_internal(KEY_B))
++    assert r.status_code == 200
++
++
++# ---------------------------------------------------------------------------
++# プラットフォーム側: キー決定関数の単体確認
++# ---------------------------------------------------------------------------
++
++def _fake_request(host, headers):
++    scope = {
++        "type": "http", "method": "GET", "path": "/",
++        "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
++        "client": (host, 12345), "server": ("x", 80),
++        "scheme": "http", "query_string": b"",
++    }
++    return Request(scope)
++
++
++def test_get_ip_for_limit_branches(platform):
++    assert platform.get_ip_for_limit(
++        _fake_request("127.0.0.1", _internal(KEY_A))) == "viewer:" + KEY_A
++    assert platform.get_ip_for_limit(
++        _fake_request("127.0.0.1", _internal())) == "127.0.0.1"
++    # 内部トークンがあっても localhost 以外からは信頼しない
++    assert platform.get_ip_for_limit(
++        _fake_request("203.0.113.9", _internal(KEY_A))) == "203.0.113.9"
++
++
++# ---------------------------------------------------------------------------
++# 閲覧側: キー計算と秘密の解決
++# ---------------------------------------------------------------------------
++
++def _viewer_request(viewer, host, headers=None):
++    raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
++    scope = {
++        "type": "http", "method": "POST", "path": "/auth/login",
++        "headers": raw, "client": (host, 12345), "server": ("x", 8001),
++        "scheme": "http", "query_string": b"",
++    }
++    return Request(scope)
++
++
++@pytest.fixture()
++def viewer_secret(viewer, monkeypatch):
++    monkeypatch.setattr(viewer, "_client_key_secret_cache", None)
++    return viewer
++
++
++def test_client_key_is_hmac_of_ip(viewer_secret, monkeypatch):
++    monkeypatch.setenv("MANGA_CLIENT_KEY_SECRET", "unit-test-secret")
++    req = _viewer_request(viewer_secret, "203.0.113.7")
++    expected = hmac.new(b"unit-test-secret", b"203.0.113.7",
++                        hashlib.sha256).hexdigest()
++    assert viewer_secret._client_key_for(req) == expected
++
++
++def test_client_key_uses_cf_ip_when_trusted(viewer_secret, monkeypatch):
++    monkeypatch.setenv("MANGA_CLIENT_KEY_SECRET", "unit-test-secret")
++    monkeypatch.setenv("MANGA_TRUST_CF_HEADER", "1")
++    req = _viewer_request(viewer_secret, "10.0.0.1",
++                          {"CF-Connecting-IP": "198.51.100.9"})
++    expected = hmac.new(b"unit-test-secret", b"198.51.100.9",
++                        hashlib.sha256).hexdigest()
++    assert viewer_secret._client_key_for(req) == expected
++
++
++def test_auth_proxy_headers_carry_key(viewer_secret, monkeypatch):
++    monkeypatch.setenv("MANGA_CLIENT_KEY_SECRET", "unit-test-secret")
++    monkeypatch.setenv("MANGA_INTERNAL_TOKEN", TOKEN)
++    req = _viewer_request(viewer_secret, "203.0.113.7")
++    headers = viewer_secret._auth_proxy_headers(req)
++    assert headers["X-Internal-Token"] == TOKEN
++    assert headers["X-Viewer-Client-Key"] == hmac.new(
++        b"unit-test-secret", b"203.0.113.7", hashlib.sha256).hexdigest()
++
++
++def test_secret_file_generated_with_0600(viewer_secret, monkeypatch, tmp_path):
++    monkeypatch.delenv("MANGA_CLIENT_KEY_SECRET", raising=False)
++    target = tmp_path / "instance" / "client_key_secret"
++    monkeypatch.setattr(viewer_secret, "_client_key_secret_file",
++                        lambda: str(target))
++    value = viewer_secret._client_key_secret()
++    assert len(value) == 64 and all(c in "0123456789abcdef" for c in value)
++    assert target.read_text().strip() == value
++    assert stat.S_IMODE(os.stat(target).st_mode) == 0o600
++    # 2回目はファイルの値を返す（再生成しない）
++    monkeypatch.setattr(viewer_secret, "_client_key_secret_cache", None)
++    assert viewer_secret._client_key_secret() == value
++
++
++def test_secret_env_takes_priority(viewer_secret, monkeypatch, tmp_path):
++    target = tmp_path / "client_key_secret"
++    target.write_text("file-value")
++    monkeypatch.setattr(viewer_secret, "_client_key_secret_file",
++                        lambda: str(target))
++    monkeypatch.setenv("MANGA_CLIENT_KEY_SECRET", "env-value")
++    assert viewer_secret._client_key_secret() == "env-value"
++
++
++def test_login_endpoint_passes_request_to_proxy(viewer, viewer_client, monkeypatch):
++    captured = {}
++
++    async def fake_login(username, password, request=None):
++        captured["request"] = request
++        return "token", {"id": 1, "username": username}
++
++    monkeypatch.setattr(viewer, "_platform_login", fake_login)
++    r = viewer_client.post("/auth/login",
++                           data={"username": "rk_ep", "password": "password123"})
++    assert r.status_code == 200
++    assert captured["request"] is not None
+--- a/tests/test_ratelimit_key2.py
++++ b/tests/test_ratelimit_key2.py
+@@ -0,0 +1,124 @@
++"""段階2（ユーザー名単位の二重化）の検証。
++
++ログインには IP/クライアントキー単位の制限に加えて、対象ユーザー名
++単位の失敗カウンタ（5回/60秒）もかかる。送信元キーを次々に変えても
++（閲覧側の秘密が差し替わってクライアントキーが全交換されても）、
++同一アカウントへの失敗は数え続けられることを確認する。
++
++実装メモ: slowapi の key_func は非同期関数に対応していない（コルーチン
++オブジェクトがそのままキー文字列になり枠が貯まらないことを実測で確認）
++ため、ユーザー名のカウントはハンドラ側で行う。成功でリセットされる。
++"""
++import time
++from collections import deque
++
++import pytest
++from fastapi.testclient import TestClient
++
++TOKEN = "ratelimit2-test-token"
++
++
++@pytest.fixture(autouse=True)
++def _env(platform, monkeypatch):
++    monkeypatch.setenv("MANGA_INTERNAL_TOKEN", TOKEN)
++    platform.limiter.reset()
++    platform._login_failures.clear()
++    yield
++    platform.limiter.reset()
++    platform._login_failures.clear()
++
++
++class _LocalhostApp:
++    def __init__(self, app):
++        self.app = app
++
++    async def __call__(self, scope, receive, send):
++        if scope.get("type") == "http":
++            scope = dict(scope, client=("127.0.0.1", 50000))
++        await self.app(scope, receive, send)
++
++
++@pytest.fixture()
++def internal_client(platform):
++    return TestClient(_LocalhostApp(platform.app),
++                      raise_server_exceptions=False)
++
++
++def _key(n):
++    return format(n, "x").rjust(64, "0")
++
++
++def _login(client, username, password, key=None):
++    headers = {"X-Internal-Token": TOKEN}
++    if key is not None:
++        headers["X-Viewer-Client-Key"] = key
++    return client.post("/api/auth/token",
++                       data={"username": username, "password": password},
++                       headers=headers)
++
++
++def test_username_bucket_survives_client_key_rotation(internal_client, make_user):
++    make_user("rk2_victim")
++    # 送信元キーを毎回変えながら5回失敗する（IP側の枠は毎回新しい）
++    for i in range(5):
++        r = _login(internal_client, "rk2_victim", "wrong-password", key=_key(i + 1))
++        assert r.status_code == 401
++    # 新しいキーから正しい資格情報でも、ユーザー名の枠で止まる
++    r = _login(internal_client, "rk2_victim", "password123", key=_key(99))
++    assert r.status_code == 429
++    # キーなし（直接相当）でも止まる
++    r = _login(internal_client, "rk2_victim", "password123")
++    assert r.status_code == 429
++
++
++def test_username_bucket_is_per_user(internal_client, make_user):
++    make_user("rk2_victim2")
++    make_user("rk2_other")
++    for i in range(5):
++        r = _login(internal_client, "rk2_victim2", "wrong-password", key=_key(i + 1))
++        assert r.status_code == 401
++    # 別のユーザーは巻き込まれない
++    r = _login(internal_client, "rk2_other", "password123", key=_key(50))
++    assert r.status_code == 200
++
++
++def test_username_limit_counts_direct_logins(platform_client, make_user):
++    make_user("rk2_direct")
++    for _ in range(5):
++        r = platform_client.post(
++            "/api/auth/token",
++            data={"username": "rk2_direct", "password": "wrong-password"})
++        assert r.status_code == 401
++    r = platform_client.post(
++        "/api/auth/token",
++        data={"username": "rk2_direct", "password": "password123"})
++    assert r.status_code == 429
++
++
++def test_success_clears_failures(internal_client, make_user):
++    make_user("rk2_reset")
++    for i in range(4):
++        r = _login(internal_client, "rk2_reset", "wrong-password", key=_key(i + 1))
++        assert r.status_code == 401
++    # 成功すると失敗カウントがリセットされる
++    r = _login(internal_client, "rk2_reset", "password123", key=_key(10))
++    assert r.status_code == 200
++    for i in range(4):
++        r = _login(internal_client, "rk2_reset", "wrong-password", key=_key(20 + i))
++        assert r.status_code == 401
++    r = _login(internal_client, "rk2_reset", "password123", key=_key(30))
++    assert r.status_code == 200
++
++
++def test_failure_counter_helpers(platform):
++    assert platform._login_user_blocked("rk2_unit") is False
++    for _ in range(5):
++        platform._record_login_failure("rk2_unit")
++    assert platform._login_user_blocked("rk2_unit") is True
++    assert platform._login_user_blocked("rk2_someone_else") is False
++    platform._clear_login_failures("rk2_unit")
++    assert platform._login_user_blocked("rk2_unit") is False
++    # ウィンドウを過ぎた失敗は数えない
++    old = time.monotonic() - 120
++    platform._login_failures["rk2_old"] = deque([old] * 5)
++    assert platform._login_user_blocked("rk2_old") is False
+--- a/tests/test_ratelimit_key3.py
++++ b/tests/test_ratelimit_key3.py
+@@ -0,0 +1,152 @@
++"""レート制限キー分離 段階3: プラットフォームの 429 を閲覧側が正しく案内する。
++
++プラットフォームの 429（slowapi のプレーンテキスト、および段階2の
++ユーザー名カウンタの JSON）は、閲覧側では従来「パスワードが違う」
++「登録に失敗しました」に化けていた。429 のときは混雑の案内を返すことを、
++実プラットフォームを別スレッドで起動して HTTP 越しの実フローで確認する
++（test_access_phase3 と同方式）。
++"""
++import socket
++import threading
++import time
++
++import httpx
++import pytest
++from fastapi.testclient import TestClient
++
++MESSAGE = "混み合っています。少し待ってから再試行してください"
++PASSWORD_MESSAGE = "ユーザー名またはパスワードが正しくありません"
++
++
++@pytest.fixture(autouse=True)
++def _reset(platform, viewer):
++    platform.limiter.reset()
++    platform._login_failures.clear()
++    viewer._auth_store.clear()
++    yield
++    platform.limiter.reset()
++    platform._login_failures.clear()
++    viewer._auth_store.clear()
++
++
++def _free_port():
++    s = socket.socket()
++    s.bind(("127.0.0.1", 0))
++    port = s.getsockname()[1]
++    s.close()
++    return port
++
++
++@pytest.fixture(scope="module")
++def live_platform(platform):
++    import uvicorn
++    # この検証環境には外向きプロキシの環境変数があり、httpx/requests が
++    # localhost 宛てでも掴んで壊れるため、テスト中だけ外す（本番コードは不変）。
++    import os
++    for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
++                "http_proxy", "https_proxy", "all_proxy", "no_proxy"):
++        os.environ.pop(var, None)
++    port = _free_port()
++    base = f"http://127.0.0.1:{port}"
++    config = uvicorn.Config(platform.app, host="127.0.0.1", port=port, log_level="error")
++    server = uvicorn.Server(config)
++    thread = threading.Thread(target=server.run, daemon=True)
++    thread.start()
++    deadline = time.time() + 15
++    while time.time() < deadline:
++        try:
++            if httpx.get(f"{base}/api/public/catalog", timeout=1.0).status_code == 200:
++                break
++        except Exception:
++            time.sleep(0.1)
++    else:
++        raise RuntimeError("platform server did not start")
++    yield base
++    server.should_exit = True
++    thread.join(timeout=5)
++
++
++@pytest.fixture()
++def env(viewer, live_platform, monkeypatch):
++    monkeypatch.setattr(viewer, "PLATFORM_BASE_URL", live_platform)
++    monkeypatch.setenv("PLATFORM_BASE_URL", live_platform)
++    return live_platform
++
++
++@pytest.fixture()
++def vclient(viewer):
++    # with で入ると lifespan の終了処理が共有 executor を止めてしまうため、
++    # コンテキストなしで使う（TestClient は未入場でもリクエストできる）
++    yield TestClient(viewer.app)
++
++
++def _make_user(platform, username, account_type="reader"):
++    import bcrypt as _bcrypt
++    db = platform.SessionLocal()
++    u = platform.User(
++        username=username, email=f"{username}@example.com",
++        hashed_password=_bcrypt.hashpw(b"password123", _bcrypt.gensalt()).decode(),
++        is_active=True, account_type=account_type)
++    db.add(u)
++    db.commit()
++    db.refresh(u)
++    uid = u.id
++    db.close()
++    return uid
++
++
++def test_login_wrong_password_keeps_password_message(env, vclient, platform):
++    _make_user(platform, "rk3_wrong_user")
++    r = vclient.post("/auth/login",
++                     data={"username": "rk3_wrong_user", "password": "wrongpass999"})
++    assert r.status_code == 401
++    assert r.json()["detail"] == PASSWORD_MESSAGE
++
++
++def test_login_rate_limited_shows_congestion_message(env, vclient, platform):
++    _make_user(platform, "rk3_login_user")
++    # 同じクライアントキーからの失敗を上限（5回/分）まで重ねる
++    for _ in range(5):
++        r = vclient.post("/auth/login",
++                         data={"username": "rk3_login_user",
++                               "password": "wrongpass999"})
++        assert r.status_code == 401
++        assert r.json()["detail"] == PASSWORD_MESSAGE
++    # 枠が尽きた状態では、正しい資格情報でも 429 として混雑の案内になる
++    # （従来は 401「パスワードが違う」に化けていた）
++    r = vclient.post("/auth/login",
++                     data={"username": "rk3_login_user", "password": "password123"})
++    assert r.status_code == 429
++    assert r.json()["detail"] == MESSAGE
++
++
++def test_register_rate_limited_shows_congestion_message(env, vclient):
++    # 登録は 3回/時（クライアントキー単位）。3人目までは通る
++    for name in ("rk3_reg_a", "rk3_reg_b", "rk3_reg_c"):
++        r = vclient.post("/auth/register",
++                         data={"username": name, "email": f"{name}@example.com",
++                               "password": "password123"})
++        assert r.status_code == 200
++    # 4人目はプラットフォームが 429 を返し、閲覧側は混雑の案内にする
++    # （従来は 400「登録に失敗しました」に化けていた）
++    r = vclient.post("/auth/register",
++                     data={"username": "rk3_reg_d",
++                           "email": "rk3_reg_d@example.com",
++                           "password": "password123"})
++    assert r.status_code == 429
++    assert r.json()["detail"] == MESSAGE
++
++
++def test_register_duplicate_keeps_platform_detail(env, vclient):
++    r = vclient.post("/auth/register",
++                     data={"username": "rk3_dup_user",
++                           "email": "rk3_dup_user@example.com",
++                           "password": "password123"})
++    assert r.status_code == 200
++    # 429 以外の失敗は従来どおりプラットフォームの detail をそのまま出す
++    r = vclient.post("/auth/register",
++                     data={"username": "rk3_dup_user",
++                           "email": "rk3_dup_other@example.com",
++                           "password": "password123"})
++    assert r.status_code == 400
++    assert r.json()["detail"] == "使用済みのユーザー名です"

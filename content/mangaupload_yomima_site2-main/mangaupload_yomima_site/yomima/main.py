@@ -14,6 +14,7 @@ import html
 import concurrent.futures
 import time
 import hashlib
+import hmac
 import secrets
 import os
 import httpx
@@ -85,6 +86,76 @@ def get_client_ip(request: Request) -> str:
             return cf_ip
     return request.client.host if request.client else "unknown"
 
+
+# ---------------------------------------------------------------------------
+# クライアントキー（プラットフォームのレート制限を読者ごとに分ける）
+# ---------------------------------------------------------------------------
+_client_key_secret_cache: Optional[str] = None
+
+
+def _client_key_secret_file() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "instance", "client_key_secret")
+
+
+def _client_key_secret() -> str:
+    """クライアントキー計算用の秘密。
+
+    解決順: 環境変数 MANGA_CLIENT_KEY_SECRET ＞ instance/client_key_secret
+    ファイル ＞ 初回に生成して同ファイルへ保存（0600）。
+    秘密は閲覧側だけが持ち、プラットフォームには渡らない。
+    用意できなければ空文字を返し、その場合はキー自体を付けない
+    （プラットフォーム側は従来どおり閲覧側IPで数える）。
+    """
+    global _client_key_secret_cache
+    if _client_key_secret_cache is not None:
+        return _client_key_secret_cache
+    env = os.environ.get("MANGA_CLIENT_KEY_SECRET", "")
+    if env:
+        _client_key_secret_cache = env
+        return env
+    path = _client_key_secret_file()
+    try:
+        if os.path.exists(path):
+            with open(path) as f:
+                value = f.read().strip()
+            _client_key_secret_cache = value
+            return value
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        value = secrets.token_hex(32)
+        tmp = path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(value)
+        os.replace(tmp, path)
+        _client_key_secret_cache = value
+        return value
+    except OSError:
+        _client_key_secret_cache = ""
+        return ""
+
+
+def _client_key_for(request: Request) -> str:
+    """読者の実IPから不透明なクライアントキーを計算する（HMAC-SHA256 hex）。
+
+    生IPはプラットフォームに送らない。秘密が無ければ空文字。
+    """
+    sec = _client_key_secret()
+    if not sec:
+        return ""
+    return hmac.new(sec.encode("utf-8"),
+                    get_client_ip(request).encode("utf-8"),
+                    hashlib.sha256).hexdigest()
+
+
+def _auth_proxy_headers(request: Request) -> dict:
+    """プラットフォームの認証系への代理送信用ヘッダ（内部トークン＋クライアントキー）。"""
+    headers = _internal_headers()
+    key = _client_key_for(request)
+    if key:
+        headers["X-Viewer-Client-Key"] = key
+    return headers
+
 # ---------------------------------------------------------------------------
 # レート制限
 # ---------------------------------------------------------------------------
@@ -117,6 +188,7 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
 # 読者アカウント（プラットフォームの JWT はサーバー側だけに保持）
 # ---------------------------------------------------------------------------
 AUTH_TTL_SECONDS = 3600  # プラットフォームのトークン有効期限（60分）に合わせる
+_RATE_LIMIT_MESSAGE = "混み合っています。少し待ってから再試行してください"
 _auth_store: dict = {}   # {cookie_token: {platform_token, user_id, username, expires_at}}
 _grants_cache: dict = {} # {user_id: (取得時刻, {(author_id, title_id)})}
 
@@ -133,13 +205,18 @@ def _current_reader(request: Request):
     return entry
 
 
-async def _platform_login(username: str, password: str):
+async def _platform_login(username: str, password: str,
+                          request: Optional[Request] = None):
     """プラットフォームでログインし (platform_token, me) を返す。"""
+    headers = _auth_proxy_headers(request) if request is not None else {}
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.post(
             f"{PLATFORM_BASE_URL}/api/auth/token",
             data={"username": username, "password": password},
+            headers=headers,
         )
+        if resp.status_code == 429:
+            raise HTTPException(status_code=429, detail=_RATE_LIMIT_MESSAGE)
         if resp.status_code != 200:
             raise HTTPException(status_code=401, detail="ユーザー名またはパスワードが正しくありません")
         platform_token = resp.json()["access_token"]
@@ -167,27 +244,31 @@ def _start_auth_session(platform_token: str, me: dict) -> JSONResponse:
 
 
 @app.post("/auth/login")
-async def auth_login(username: str = Form(...), password: str = Form(...)):
-    platform_token, me = await _platform_login(username, password)
+async def auth_login(request: Request, username: str = Form(...),
+                     password: str = Form(...)):
+    platform_token, me = await _platform_login(username, password, request)
     return _start_auth_session(platform_token, me)
 
 
 @app.post("/auth/register")
-async def auth_register(username: str = Form(...), email: str = Form(...),
-                        password: str = Form(...)):
+async def auth_register(request: Request, username: str = Form(...),
+                        email: str = Form(...), password: str = Form(...)):
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.post(
             f"{PLATFORM_BASE_URL}/api/auth/signup",
             json={"username": username, "email": email, "password": password,
                   "account_type": "reader"},
+            headers=_auth_proxy_headers(request),
         )
+        if resp.status_code == 429:
+            raise HTTPException(status_code=429, detail=_RATE_LIMIT_MESSAGE)
         if resp.status_code != 200:
             try:
                 detail = resp.json().get("detail", "登録に失敗しました")
             except Exception:
                 detail = "登録に失敗しました"
             raise HTTPException(status_code=400, detail=detail)
-    platform_token, me = await _platform_login(username, password)
+    platform_token, me = await _platform_login(username, password, request)
     return _start_auth_session(platform_token, me)
 
 

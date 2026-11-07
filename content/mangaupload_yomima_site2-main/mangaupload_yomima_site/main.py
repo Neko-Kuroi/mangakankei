@@ -10,6 +10,7 @@ import tempfile
 import secrets
 import asyncio
 import threading
+from collections import deque
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime, timedelta, UTC
@@ -477,7 +478,67 @@ def update_progress(job_id: str, phase: str, current: int, total: int, **kwargs)
 # レート制限
 # ---------------------------------------------------------------------------
 def get_ip_for_limit(request: Request) -> str:
+    """レート制限のキー。
+
+    閲覧側経由の認証では、閲覧側が読者の実IPから計算した不透明な
+    クライアントキー（X-Viewer-Client-Key）をキーに使うことで、
+    全読者が閲覧側サーバーの IP 枠を分け合わないようにする。
+    生IPはプラットフォームに届かない。ヘッダを信頼するのは内部
+    リクエスト（localhost＋内部トークン一致）のときだけ。
+    """
+    if _is_internal_request(request):
+        key = request.headers.get("X-Viewer-Client-Key", "")
+        if re.fullmatch(r"[0-9a-f]{64}", key):
+            return "viewer:" + key
     return get_client_ip(request)
+
+
+# ---------------------------------------------------------------------------
+# ログインのユーザー名単位カウンタ（IP/クライアントキー単位と併用）
+#
+# slowapi の key_func は非同期関数に対応しておらず（コルーチンがそのまま
+# キー文字列化されて枠が貯まらないことを実測で確認）、フォームの
+# ユーザー名をキーにできないため、ハンドラ側で失敗回数を数える。
+# 送信元を変えても、閲覧側の秘密の差し替えでクライアントキーが全交換
+# されても、同一アカウントへの失敗は数え続けられる。成功でリセット。
+# ---------------------------------------------------------------------------
+_LOGIN_USER_LIMIT = 5
+_LOGIN_USER_WINDOW = 60.0
+_login_failures: dict = {}
+_login_failures_lock = threading.Lock()
+
+
+def _login_user_blocked(username: str) -> bool:
+    """直近ウィンドウ内の失敗が上限に達していれば True。"""
+    now = time.monotonic()
+    with _login_failures_lock:
+        q = _login_failures.get(username)
+        if not q:
+            return False
+        cutoff = now - _LOGIN_USER_WINDOW
+        while q and q[0] < cutoff:
+            q.popleft()
+        return len(q) >= _LOGIN_USER_LIMIT
+
+
+def _record_login_failure(username: str) -> None:
+    now = time.monotonic()
+    with _login_failures_lock:
+        q = _login_failures.setdefault(username, deque())
+        cutoff = now - _LOGIN_USER_WINDOW
+        while q and q[0] < cutoff:
+            q.popleft()
+        q.append(now)
+        if len(_login_failures) > 4096:
+            stale = [n for n, dq in _login_failures.items()
+                     if not dq or dq[-1] < cutoff]
+            for n in stale:
+                _login_failures.pop(n, None)
+
+
+def _clear_login_failures(username: str) -> None:
+    with _login_failures_lock:
+        _login_failures.pop(username, None)
 
 def _is_internal_request(request: Request) -> bool:
     """同一マシン上の内部クライアント（閲覧側など）からのリクエストかどうか。
@@ -561,11 +622,16 @@ async def login(
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db)
 ):
+    if _login_user_blocked(form_data.username):
+        raise HTTPException(429, "リクエストが多すぎます。しばらく待ってから再試行してください。")
     user = db.query(User).filter(User.username == form_data.username).first()
     if not user or not _verify_password(form_data.password, user.hashed_password):
+        _record_login_failure(form_data.username)
         raise HTTPException(401, "ユーザー名またはパスワードが正しくありません")
     if not user.is_active:
+        _record_login_failure(form_data.username)
         raise HTTPException(401, "ユーザー名またはパスワードが正しくありません")
+    _clear_login_failures(form_data.username)
     access_token = jwt.encode(
         {"sub": str(user.id), "exp": datetime.now(UTC) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)},
         SECRET_KEY, algorithm=ALGORITHM
