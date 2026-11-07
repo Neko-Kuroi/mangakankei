@@ -1,0 +1,174 @@
+diff --git a/tests/test_thumb_proxy.py b/tests/test_thumb_proxy.py
+new file mode 100644
+index 0000000..99d814d
+--- /dev/null
++++ b/tests/test_thumb_proxy.py
+@@ -0,0 +1,96 @@
++"""/thumbnail のプロキシ: 内部トークンの流出と、HTML の素通しを防ぐ。
++
++組み立てる thumb URL は、利用者が渡した url の文字列から作る。外部ホストの
++url（宛先ポリシーは通る）でも、内部トークンを付けて取りに行ってはいけない。
++"""
++import threading
++from http.server import BaseHTTPRequestHandler, HTTPServer
++
++import pytest
++
++TOKEN = "SECRET-INTERNAL-TOKEN"
++PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
++
++
++@pytest.fixture(autouse=True)
++def _reset_limits(viewer):
++    viewer.limiter.reset()
++
++
++@pytest.fixture()
++def upstream(monkeypatch):
++    """thumb への GET を記録する小さなサーバー。応答は state で切り替える。"""
++    state = {"ctype": "image/png", "body": PNG, "seen": []}
++
++    class H(BaseHTTPRequestHandler):
++        def do_GET(self):
++            state["seen"].append((self.path, self.headers.get("x-internal-token")))
++            if not self.path.startswith("/api/public/thumb/"):
++                self.send_response(404)
++                self.send_header("Content-Length", "0")
++                self.end_headers()
++                return
++            self.send_response(200)
++            self.send_header("Content-Type", state["ctype"])
++            self.send_header("Content-Length", str(len(state["body"])))
++            self.end_headers()
++            self.wfile.write(state["body"])
++
++        def log_message(self, *a):
++            pass
++
++    srv = HTTPServer(("127.0.0.1", 0), H)
++    threading.Thread(target=srv.serve_forever, daemon=True).start()
++    state["port"] = srv.server_address[1]
++    state["url"] = f"http://127.0.0.1:{srv.server_address[1]}/api/public/cbz/1/2/3.cbz"
++    monkeypatch.setenv("MANGA_INTERNAL_TOKEN", TOKEN)
++    yield state
++    srv.shutdown()
++
++
++def _thumb(viewer_client, url):
++    r = viewer_client.get("/session", params={"url": url})
++    assert r.status_code == 200, r.text
++    return viewer_client.get(
++        "/thumbnail",
++        params={"url": url, "index": 0, "session_token": r.json()["session_token"]},
++    )
++
++
++def test_external_host_gets_no_token_and_no_request(viewer_client, upstream, monkeypatch):
++    # プラットフォームは別の場所。upstream は「許可された外部ホスト」にすぎない
++    monkeypatch.setenv("PLATFORM_BASE_URL", "http://localhost:8000")
++    monkeypatch.setenv("MANGA_URL_ALLOW_HOSTS", "127.0.0.1")
++    r = _thumb(viewer_client, upstream["url"])
++    assert not any(p.startswith("/api/public/thumb/") for p, _ in upstream["seen"])
++    assert all(t is None for _, t in upstream["seen"])
++    assert r.status_code == 404  # ダウンロード前なのでフォールバックも無い
++
++
++def test_platform_origin_still_proxied_with_token(viewer_client, upstream, monkeypatch):
++    monkeypatch.setenv("PLATFORM_BASE_URL", f"http://127.0.0.1:{upstream['port']}")
++    r = _thumb(viewer_client, upstream["url"])
++    assert r.status_code == 200
++    assert r.headers["content-type"] == "image/png"
++    assert r.headers["x-content-type-options"] == "nosniff"
++    assert r.content == PNG
++    assert ("/api/public/thumb/1/2/3/0", TOKEN) in upstream["seen"]
++
++
++@pytest.mark.parametrize("ctype", ["text/html", "text/html; charset=utf-8",
++                                   "image/svg+xml", "application/octet-stream"])
++def test_non_image_content_type_is_not_relayed(viewer_client, upstream, monkeypatch, ctype):
++    monkeypatch.setenv("PLATFORM_BASE_URL", f"http://127.0.0.1:{upstream['port']}")
++    upstream["ctype"] = ctype
++    upstream["body"] = b"<script>alert(1)</script>"
++    r = _thumb(viewer_client, upstream["url"])
++    assert b"<script>" not in r.content
++    assert r.headers["content-type"].split(";")[0] not in ("text/html", "image/svg+xml")
++
++
++def test_content_type_parameters_are_stripped(viewer_client, upstream, monkeypatch):
++    monkeypatch.setenv("PLATFORM_BASE_URL", f"http://127.0.0.1:{upstream['port']}")
++    upstream["ctype"] = "image/png; foo=bar"
++    r = _thumb(viewer_client, upstream["url"])
++    assert r.status_code == 200
++    assert r.headers["content-type"] == "image/png"
+diff --git a/yomima/main.py b/yomima/main.py
+index 44532d9..8caf4ea 100644
+--- a/yomima/main.py
++++ b/yomima/main.py
+@@ -827,6 +827,13 @@ async def download_start(request: Request, url: str = Query(...),
+ # episode_thumbs/ から返す（非スクランブル・事前生成済み）
+ # ---------------------------------------------------------------------------
+ 
++# サムネイルとして返してよい Content-Type（SVG や HTML は通さない）
++_THUMB_MEDIA_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
++_THUMB_HEADERS = {
++    "Cache-Control": "private, max-age=86400",
++    "X-Content-Type-Options": "nosniff",
++}
++
+ @app.get("/thumbnail")
+ @limiter.limit("30/minute")
+ async def serve_thumbnail(
+@@ -841,7 +848,10 @@ async def serve_thumbnail(
+         raise HTTPException(status_code=403, detail="セッションが無効です")
+     _enforce_session_unlock(request, session)
+ 
+-    # 宛先ポリシー（組み立てる thumb URL は url と同一オリジンなので、これで足りる）
++    # 宛先ポリシー（url が取得してよい宛先かどうか）。
++    # 注意: thumb URL は url の文字列から組み立てるので、url の宛先が許可されても
++    # 「プラットフォームのオリジン」とは限らない。内部トークンを付けて取りに行く
++    # のは、組み立てた thumb URL がプラットフォームのオリジンのときだけにする。
+     allowed, reason = mg.is_url_fetch_allowed(url)
+     if not allowed:
+         raise HTTPException(status_code=400, detail=reason)
+@@ -874,7 +884,9 @@ async def serve_thumbnail(
+             if token_part:
+                 thumb_url += f"?{token_part}"
+ 
+-    if thumb_url:
++    # 外部のホストには内部トークンも読者トークンも送らない（外部のCBZは下の
++    # フォールバック＝ダウンロード済みの中身から生成、に回す）
++    if thumb_url and mg.is_platform_origin(thumb_url):
+         try:
+             headers = _internal_headers()
+             if session.get("auth_token") and "/api/public/thumb/" in thumb_url:
+@@ -882,13 +894,17 @@ async def serve_thumbnail(
+                 headers["Authorization"] = f"Bearer {session['auth_token']}"
+             if session.get("age_verified") and "/api/public/thumb/" in thumb_url:
+                 headers["X-Age-Verified"] = "1"
+-            async with httpx.AsyncClient(timeout=5.0) as client:
++            async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
+                 resp = await client.get(thumb_url, headers=headers)
+-                if resp.status_code == 200:
++                # 画像として返せるものだけ通す。text/html などをそのまま返すと
++                # このオリジンから任意のHTMLを配ることになる
++                media_type = resp.headers.get("content-type", "image/jpeg") \
++                    .split(";")[0].strip().lower()
++                if resp.status_code == 200 and media_type in _THUMB_MEDIA_TYPES:
+                     return Response(
+                         content=resp.content,
+-                        media_type=resp.headers.get("content-type", "image/jpeg"),
+-                        headers={"Cache-Control": "private, max-age=86400"},
++                        media_type=media_type,
++                        headers=_THUMB_HEADERS,
+                     )
+         except Exception:
+             pass
+@@ -917,7 +933,7 @@ async def serve_thumbnail(
+     return Response(
+         content=data,
+         media_type=media_type,
+-        headers={"Cache-Control": "private, max-age=86400"},
++        headers=_THUMB_HEADERS,
+     )
+ 
+ # ---------------------------------------------------------------------------
